@@ -43,6 +43,11 @@ struct Address
         from_cstring(&buf[0]).unwrap_or("")
 end Address
 
+// **`Address` is exactly 128 bytes and that is the limit**, because a struct over it cannot be
+// rendered at all through `str` or `s"$x"` -- card `0305`. `tests.sysl` asserts the size rather than
+// leaving a platform with a larger `sockaddr_storage` to segfault, and this `impl` is why it
+// matters.
+
 /** An address renders the way a person writes one: `host:port`, with a v6 host in brackets so that
  * the colons in it are not read as the separator.
  */

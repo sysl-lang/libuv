@@ -193,6 +193,15 @@ unref_lets_the_loop_end()
 
 // -- Addresses ------------------------------------------------------------------------------------
 
+// **A struct over 128 bytes cannot be rendered through `str` or `s"$x"`** -- card `0305`, where both
+// segfault with no diagnostic. `Address` is exactly 128 here and its `Display` works; on a platform
+// whose `sockaddr_storage` is larger it would not, and this is what makes that a failing test rather
+// than a crash in somebody's log line.
+@test("an address is small enough to be rendered at all")
+address_fits_under_the_display_limit()
+    assert(sizeof(Address) <= 128, "over 128 bytes, str() and interpolation segfault -- card 0305")
+    assert_eq(s"${ip4("1.2.3.4", 5).unwrap()}", "1.2.3.4:5")
+
 @test("an address is parsed, and reads back as what was written")
 addresses()
     val a = ip4("127.0.0.1", 8080).expect("a v4 address")
@@ -402,13 +411,18 @@ tty_needs_a_terminal()
 @test("a name is resolved on the pool and answered on the loop")
 resolve_localhost()
     val lp = default_loop()
-    val found: &Answers = Answers(0, 0, false)
+    val found: &Answers = Answers(0, 0, "", false)
 
     resolve("localhost", "80", (r) ->
         found.done = true
 
         r match
-            Ok(list) -> found.count = list.len
+            Ok(list) ->
+                found.count = list.len
+
+                // Rendering the *address* rather than the `AddrInfo` around it, which is what
+                // card `0305` forces and what a program wants regardless.
+                found.first = s"${list[0].address}"
             Err(e) -> found.code = e.code, AF_INET, SOCK_STREAM, 0, lp).expect("the lookup started")
 
     assert(!found.done, "nothing has been answered before the loop runs")
@@ -418,11 +432,12 @@ resolve_localhost()
     assert(found.done, "and the callback ran once it did")
     assert_eq(found.code, 0)
     assert(found.count > 0, "localhost resolves to at least one address")
+    assert_eq(found.first, "127.0.0.1:80")
 
 @test("a name that does not resolve fails in the callback")
 resolve_nothing()
     val lp = default_loop()
-    val found: &Answers = Answers(0, 0, false)
+    val found: &Answers = Answers(0, 0, "", false)
 
     resolve("no.such.host.invalid", "", (r) ->
         found.done = true
@@ -716,6 +731,7 @@ private struct Held
 private struct Answers
     count: usize
     code: i32
+    first: string
     done: bool
 
 // And for the bytes one was handed, which are the stream's buffer and have to be copied to outlive

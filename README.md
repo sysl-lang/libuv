@@ -5,7 +5,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.0" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.1" }
 }
 ```
 
@@ -246,7 +246,7 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and one of them, over five files, and every public entry point but two is named in one.**
+**A hundred and two of them, over five files, and every public entry point but two is named in one.**
 The two are `Loop.fork`, which needs a real `fork(2)` a sysl program has no way to make, and
 `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master* macOS refuses it and
 Linux allows it, so a test either way would pin a platform rather than this binding. Both are said so
@@ -263,20 +263,32 @@ socket in a temporary directory, `localhost` resolved on the thread pool, a file
 back, `echo hello` spawned with its output read through a pipe, and `/bin/pwd` run in a directory it
 was given with an environment it was given.
 
-**Six things in this README were wrong until a test said so**, which is the argument for writing them:
+**Seven things here were wrong until a test said so**, which is the argument for writing them:
 `again` refuses only a timer that was never started rather than one with no interval; `due_in` still
 reports a deadline after `stop`; `idle_time` answers zero until the loop is asked to measure it;
 `socket_pair` gives *Unix domain* sockets, so `Tcp.open` on one connects and then refuses every TCP
-option; `Pipe.chmod` takes `READABLE`/`WRITABLE` and not the stdio flags of nearly the same name; and
-`hrtime` does not share a base with `clock(CLOCK_MONOTONIC)` — seven seconds apart on this machine.
+option; `Pipe.chmod` takes `READABLE`/`WRITABLE` and not the stdio flags of nearly the same name;
+`hrtime` does not share a base with `clock(CLOCK_MONOTONIC)` — seven seconds apart on this machine;
+and a write to a peer that has gone ends the process unless `ignore_sigpipe` was called.
 
-## A note on `?`
+An eighth was a compiler bug rather than a mistake here: rendering an `AddrInfo` segfaulted, because
+**a struct over 128 bytes cannot be rendered through `str` or `s"$x"` at all** while `print` of one
+works. That is card `0305`; `AddrInfo` has no `Display` until it closes, and a test asserts `Address`
+stays under the limit so that a platform with a bigger `sockaddr_storage` fails rather than crashes.
 
-Two kinds of function in this package are written without `?` on purpose — the ones answering with an
-`Address` or a `Stat`. Both are larger than 128 bytes, and a `?` in a function whose result is
-returned through an `sret` out-parameter currently emits a direct return instead; clang refuses the
-IR, naming a temporary file and the word `void`. It is filed as card `0304` against the compiler, and
-the comment at each site says so. Nothing about the interface is affected.
+## Two compiler bugs this package works around
+
+Both are the same 128-byte boundary, which is where a value stops being passed and returned directly.
+
+**Card `0304`** — a `?` in a function whose result is larger than 128 bytes emits a direct return out
+of a function the ABI made `void`, and clang refuses the compiler's own IR. So the functions
+answering with an `Address` or a `Stat` are written without `?`; the comment at each site says so,
+and nothing about the interface is affected.
+
+**Card `0305`** — a struct over 128 bytes cannot implement `Display` usefully: `str(x)` and `s"$x"`
+segfault with no diagnostic, while `print(x)` works, and the receiver cannot be taken by reference
+because the trait fixes it. So `AddrInfo` has no `Display` — render the `Address` inside it — and a
+test pins `sizeof(Address)` at or under the limit.
 
 ## License
 
