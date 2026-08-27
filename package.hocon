@@ -26,12 +26,18 @@ package {
   name    = "libuv"
   version = "0.1.0"
 
-  // **The oldest compiler this builds with.** A closure written as an argument opens its own
-  // indented block here — `t.start(0, 1000, (t) -> …)` is the shape every callback in this package
-  // is registered with — and that arrived in 0.0.76. An older compiler refuses those files with
-  // `newline expected` pointing at the first line of the body, which reads as a defect in the
-  // example rather than as a compiler too old to have the feature.
-  sysl = "0.0.76"
+  // **The compiler this was written against and the only one it is known to build with.**
+  //
+  // The newest feature it certainly needs is a closure written as an argument opening its own
+  // indented block — `t.start(0, 1000, () -> …)` is the shape every callback here is registered
+  // with, and that arrived in 0.0.76. An older compiler refuses those files with `newline expected`
+  // pointing at the first line of the body, which reads as a defect in the example rather than as a
+  // compiler too old to have the feature.
+  //
+  // The floor is written at 0.0.82 rather than 0.0.76 because that is what was **checked**: nothing
+  // here was compiled by an older release, and a floor is meant to be a fact rather than a
+  // reconstruction. Lower it when somebody builds this with one.
+  sysl = "0.0.82"
 }
 
 // **`posix`, because an event loop is the operating system's.** epoll, kqueue, a thread pool, a
