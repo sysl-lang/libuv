@@ -440,3 +440,56 @@ loop_fork()
     writer.close()
     lp.run().expect("the loop ran")
     lp.close().expect("closed")
+
+// -- Closing a handle frees it ------------------------------------------------------------------
+//
+// **This is the one property the whole package rests on, and nothing else here can see it.** A
+// handle holds a reference to *itself* so that the loop owns it, and `close` is what drops that --
+// so a `finish_close` missing one line leaks every handle a program ever opens, silently, with
+// every other test still green. Each handle type writes its own `finish_close`, so each is churned
+// here rather than one standing for the rest.
+//
+// **Resident memory is the only observer available**, since a refcount is not something a program
+// can ask about. It is blunt but it discriminates: with the self-reference cleared the first round
+// claims pages from the allocator and every round after it grows by nothing, and with one line
+// removed from a single `finish_close` the growth is linear -- measured at about six megabytes a
+// round for the timers alone.
+//
+// The first round is a warm-up for exactly that reason: what is asserted is the growth *after* the
+// allocator has settled.
+@test("closing a handle releases it, for every kind of handle there is")
+closing_frees()
+    val lp = default_loop()
+
+    churn(lp)
+
+    val before = resident_memory().expect("rss")
+
+    churn(lp)
+    churn(lp)
+
+    val after = resident_memory().expect("rss")
+    val grew = after - before
+
+    // Two rounds that free nothing grow by tens of megabytes; two that free everything grow by
+    // nothing at all. A mebibyte is far below the first and far above the second.
+    assert(grew < 1048576, "closed handles were freed rather than kept")
+
+private churn(lp: &Loop)
+    val cheap = 10000
+    val sockets = 2000
+
+    for i in 0..<cheap
+        timer(lp).expect("a timer").close()
+        idle(lp).expect("an idle watcher").close()
+        prepare(lp).expect("a prepare watcher").close()
+        check(lp).expect("a check watcher").close()
+        notifier(noop, lp).expect("a notifier").close()
+        signal(lp).expect("a signal watcher").close()
+
+    for i in 0..<sockets
+        tcp(lp).expect("a socket").close()
+        pipe(false, lp).expect("a pipe").close()
+
+    // The close callbacks run on the next turn, which is what actually releases each handle.
+    lp.run().expect("the loop ran")

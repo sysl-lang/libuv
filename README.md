@@ -246,10 +246,25 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and three of them, over five files, and every public entry point but one is named in
-one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
+**A hundred and fourteen of them, over six files, and every public entry point but one is exercised
+by one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
 macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
 binding, and a test runner has no controlling terminal to use instead. It says so at the site.
+
+**The whole raw layer is exercised too**, which is a separate file: a declaration nothing calls is a
+declaration nothing checks, and a signature that disagrees with `uv.h` links perfectly and corrupts
+the call at run time. Every one of the 182 `extern`s is now reached, from the pleasant layer or from
+`raw_tests.sysl` directly. `uv_cancel` was deleted rather than tested — it may only be called on a
+request still in flight, and on a finished one it segfaults, so a declaration with no safe caller was
+worse than none.
+
+**The most important test is the one that watches memory.** A handle holds a reference to itself so
+that the loop owns it, and `close` dropping that is what the whole design rests on — but a refcount
+is not something a program can ask about, so a `finish_close` missing one line would leak every
+handle a program ever opened with every other test still green. `closing_frees` churns ten thousand
+of each handle type per round and asserts resident memory stops growing once the allocator has
+settled. Removing one line from any single `finish_close` turns it red; that was checked against
+three of them.
 
 **`Loop.fork` is tested by actually forking**, which took two attempts worth recording: the first
 version passed with the call under test taken out, because a loop carrying only a timer does not
