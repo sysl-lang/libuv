@@ -246,11 +246,16 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and two of them, over five files, and every public entry point but two is named in one.**
-The two are `Loop.fork`, which needs a real `fork(2)` a sysl program has no way to make, and
-`Tty.winsize`, which needs a terminal with a slave attached — on a pty *master* macOS refuses it and
-Linux allows it, so a test either way would pin a platform rather than this binding. Both are said so
-at the site.
+**A hundred and three of them, over five files, and every public entry point but one is named in
+one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
+macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
+binding, and a test runner has no controlling terminal to use instead. It says so at the site.
+
+**`Loop.fork` is tested by actually forking**, which took two attempts worth recording: the first
+version passed with the call under test taken out, because a loop carrying only a timer does not
+exercise it. What a fork invalidates is the backend's registration of *descriptors*, so the test now
+carries a live read across the fork — 2ms with the call, and a failure at its 500ms guard without
+it.
 
 The thing under test is the binding rather than libuv. What is untested anywhere else is the
 arrangement this package is built on, and every case is chosen to fail if one of these is not true: a

@@ -19,6 +19,13 @@ private struct Tally
 
 private tally() -> &Tally = Tally(0, buf())
 
+// `fork` and its two companions, declared here rather than in the binding: they are the platform's
+// and have nothing to do with libuv, and the one test below is the only thing in this package that
+// wants them.
+private extern "fork" c_fork() -> i32
+private extern "_exit" c_exit(code: i32)
+private extern "waitpid" c_waitpid(pid: i32, status: *i32, options: i32) -> i32
+
 // -- Timers -------------------------------------------------------------------------------------
 
 @test("a timer that is stopped does not fire, and keeps its callback for later")
@@ -366,3 +373,70 @@ loop_idle_time()
 
     assert(measured.idle_time() > 0, "it slept waiting for the timer, and said so")
     measured.close().expect("closed")
+
+// **This is the one test in the package that forks**, and it is the only way to reach `Loop.fork`
+// at all: the call exists to be made *in the child* of a `fork(2)`, on a loop created before it,
+// because a backend keeps kernel state a fork invalidates -- kqueue on this platform is libuv's own
+// worked example.
+//
+// **A loop carrying only a timer does not exercise it**, which is how the first version of this
+// test came to pass with the call taken out. What a fork invalidates is the backend's registration
+// of *descriptors*, so the loop has to have a live read across the fork for the repair to be about
+// anything. That is what the socket pair is here for.
+//
+// The child writes a byte to a socket the loop was already reading, and exits `0` only if the read
+// callback fires. **`_exit` rather than `exit`**, so it neither flushes the buffered output it
+// inherited -- which the parent will flush itself -- nor runs the rest of the suite.
+@test("a loop with a live read is usable in a forked child once it has been told about the fork")
+loop_fork()
+    val lp = new_loop().expect("a loop")
+    val (a, b) = socket_pair().expect("a socket pair")
+    val reader = pipe(false, lp).expect("a pipe")
+    val writer = pipe(false, lp).expect("a pipe")
+    val got = tally()
+
+    reader.open(a).expect("adopted")
+    writer.open(b).expect("adopted")
+
+    // `stop` rather than `close`, so the child returns from `run` the moment the byte lands
+    // instead of waiting out the guard below.
+    reader.read_start((r) -> r match
+        Data(bytes) ->
+            got.n += 1
+            lp.stop()
+        End -> lp.stop()
+        Failed(_) -> lp.stop()).expect("reading")
+
+    val pid = c_fork()
+
+    if pid == 0
+        var code: i32 = 3
+
+        if lp.fork().is_ok()
+            code = 2
+
+            // A guard, so a child whose loop is broken exits rather than hanging the suite.
+            val guard = timer(lp).expect("a timer")
+
+            guard.start(500, 0, () -> lp.stop()).expect("started")
+
+            writer.write([42]).expect("queued")
+
+            if lp.run().is_ok() && got.n == 1 then code = 0
+
+        c_exit(code)
+
+    assert(pid > 0, "the fork worked")
+
+    var status: i32 = 0
+
+    c_waitpid(pid, &status, 0)
+
+    // Zero is the whole word: exited normally, with status 0. Anything else is the child's own
+    // report of which step it stopped at.
+    assert_eq(status, 0)
+
+    reader.close()
+    writer.close()
+    lp.run().expect("the loop ran")
+    lp.close().expect("closed")
