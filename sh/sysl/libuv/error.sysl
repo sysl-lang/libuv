@@ -50,16 +50,11 @@ impl Eq for Error
  * This is the shape almost every call in this package answers with, since almost every call in
  * libuv answers `0` or a negative code.
  */
-check(code: i32) -> Result[unit, Error] = if code < 0 then Err(Error(code)) else Ok(())
+private[libuv] checked(code: i32) -> Result[unit, Error] = if code < 0 then Err(Error(code)) else Ok(())
 
 /** The same, for the calls that answer a count on the way through -- `try_write` and the file
  * system's reads and writes, where the number is the answer and only a negative one is a failure.
  */
-check_count(code: isize) -> Result[usize, Error] =
+private[libuv] counted(code: isize) -> Result[usize, Error] =
     if code < 0 then Err(Error(i32(code))) else Ok(usize(code))
 
-/** The error a code names, for a callback that is handed one. libuv reports a failed connection, a
- * failed write and the end of a stream through the status argument rather than through a return
- * value, and this is what turns one of those into the same `Error` everything else answers with.
- */
-error_of(code: i32) -> Error = Error(code)

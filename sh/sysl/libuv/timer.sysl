@@ -44,10 +44,10 @@ struct Timer
      */
     start(*self, timeout: u64, repeat: u64, cb: &Fn() -> unit) -> Result[unit, Error]
         self.on_tick = cb
-        check(c.timer_start(self.raw(), &timer_tick, timeout, repeat))
+        checked(c.timer_start(self.raw(), &timer_tick, timeout, repeat))
 
     /** Stop the timer. The callback is kept, so `again` can restart it. */
-    stop(*self) -> Result[unit, Error] = check(c.timer_stop(self.raw()))
+    stop(*self) -> Result[unit, Error] = checked(c.timer_stop(self.raw()))
 
     /** Stop the timer and start it again with its repeat as the new timeout.
      *
@@ -55,7 +55,7 @@ struct Timer
      * allow, and calls `again` on every byte that arrives. `EINVAL` for a timer whose repeat is
      * `0`, which has no interval to be restarted with.
      */
-    again(*self) -> Result[unit, Error] = check(c.timer_again(self.raw()))
+    again(*self) -> Result[unit, Error] = checked(c.timer_again(self.raw()))
 
     /** The repeat interval in milliseconds. */
     repeat(*self) -> u64 = c.timer_get_repeat(self.raw())
@@ -101,7 +101,7 @@ private timer_tick(h: *c.Timer) -> unit
 timer(lp: &Loop = default_loop()) -> Result[&Timer, Error]
     var t: &Timer = Timer([0; c.TIMER_WORDS], lp, None, noop, noop)
 
-    check(c.timer_init(lp.raw(), t.raw()))?
+    checked(c.timer_init(lp.raw(), t.raw()))?
 
     t.me = Some(t)
     c.handle_set_data(t.handle_ptr(), ptr_cast(&*t))

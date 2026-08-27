@@ -1,0 +1,78 @@
+// The one handle another thread may touch.
+//
+// A loop belongs to the thread that runs it, and calling anything else in this package from a
+// second thread is undefined. `send` is the exception: it is safe from anywhere, and it is how a
+// worker thread gets the loop's attention.
+//
+//     val wake = notifier(() -> drain_the_results())?
+//
+//     // ... on another thread, whenever there is something to drain:
+//     wake.send()
+//
+// **Sends coalesce.** libuv promises the callback runs at least once after a `send`, not once per
+// `send` -- several sends before the loop next turns produce one call. So the callback's job is to
+// go and look at whatever the other thread left behind, rather than to be counted.
+//
+// **What the callback reads has to be shared safely**, and this package cannot help with that: a
+// closure captures by value, so what a worker writes and the callback reads has to be behind a
+// reference both of them hold, guarded by whatever the program uses to guard it.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+/** A handle whose only operation is "wake the loop up and run this". */
+struct Async
+    private storage: [c.ASYNC_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Async]
+    private on_wake: &Fn() -> unit
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Async = ptr_cast(&self.storage[0])
+
+    /** The loop this handle is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Wake the loop and have it run the callback. **Safe from any thread**, which is the whole
+     * reason this handle exists.
+     */
+    send(*self) -> Result[unit, Error] = checked(c.async_send(self.raw()))
+end Async
+
+impl Handle for Async
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.on_wake = noop
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+private async_wake(h: *c.Async) -> unit
+    val a: *Async = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    a.on_wake()
+
+/** A handle that runs `cb` on the loop's thread whenever `send` is called from anywhere.
+ *
+ * **It is active from the moment it is created**, so it keeps the loop alive until it is closed --
+ * which is what a program wants from the thing its workers are going to call, and is why `unref`
+ * is worth knowing about for one that should not hold the process open on its own.
+ *
+ * libuv calls this a `uv_async_t`; the name here says what it does, since `async` in a language
+ * with no coroutines would promise something this is not.
+ */
+notifier(cb: &Fn() -> unit, lp: &Loop = default_loop()) -> Result[&Async, Error]
+    var a: &Async = Async([0; c.ASYNC_WORDS], lp, None, cb, noop)
+
+    checked(c.async_init(lp.raw(), a.raw(), &async_wake))?
+
+    a.me = Some(a)
+    c.handle_set_data(a.handle_ptr(), ptr_cast(&*a))
+    Ok(a)

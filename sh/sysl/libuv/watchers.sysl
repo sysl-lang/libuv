@@ -1,0 +1,178 @@
+// The three handles that are called once per turn of the loop, and differ only in where.
+//
+// | | when |
+// |---|---|
+// | `Prepare` | just before the loop blocks waiting for I/O |
+// | `Check` | just after it wakes up, before the I/O callbacks |
+// | `Idle` | every turn, and **it stops the loop from blocking at all** |
+//
+// **`Idle` is the one to be careful with.** An active idle watcher means the loop never sleeps, so
+// a program with one spins a core -- which is the point where it is used to keep a render loop or a
+// script engine running, and a bug everywhere else. `Prepare` is what "do this every turn" usually
+// means.
+//
+//     val i = idle()?
+//
+//     i.start(() -> step_the_interpreter())
+//
+// All three are the same shape as a timer: created stopped, started with a callback, and closed
+// when the program is done with them.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+/** Called every turn of the loop, and stops it ever going to sleep. */
+struct Idle
+    private storage: [c.IDLE_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Idle]
+    private on_turn: &Fn() -> unit
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Idle = ptr_cast(&self.storage[0])
+
+    /** The loop this watcher is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Call `cb` on every turn of the loop, starting with the next one. Starting a running watcher
+     * replaces the callback.
+     */
+    start(*self, cb: &Fn() -> unit) -> Result[unit, Error]
+        self.on_turn = cb
+        checked(c.idle_start(self.raw(), &idle_turn))
+
+    /** Stop calling it. */
+    stop(*self) -> Result[unit, Error] = checked(c.idle_stop(self.raw()))
+end Idle
+
+impl Handle for Idle
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.on_turn = noop
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+private idle_turn(h: *c.Idle) -> unit
+    val i: *Idle = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    i.on_turn()
+
+/** An idle watcher on `lp`, stopped. */
+idle(lp: &Loop = default_loop()) -> Result[&Idle, Error]
+    var i: &Idle = Idle([0; c.IDLE_WORDS], lp, None, noop, noop)
+
+    checked(c.idle_init(lp.raw(), i.raw()))?
+
+    i.me = Some(i)
+    c.handle_set_data(i.handle_ptr(), ptr_cast(&*i))
+    Ok(i)
+
+/** Called just before the loop blocks waiting for I/O, which is what "every turn" usually means. */
+struct Prepare
+    private storage: [c.PREPARE_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Prepare]
+    private on_turn: &Fn() -> unit
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Prepare = ptr_cast(&self.storage[0])
+
+    /** The loop this watcher is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Call `cb` just before each block. Starting a running watcher replaces the callback. */
+    start(*self, cb: &Fn() -> unit) -> Result[unit, Error]
+        self.on_turn = cb
+        checked(c.prepare_start(self.raw(), &prepare_turn))
+
+    /** Stop calling it. */
+    stop(*self) -> Result[unit, Error] = checked(c.prepare_stop(self.raw()))
+end Prepare
+
+impl Handle for Prepare
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.on_turn = noop
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+private prepare_turn(h: *c.Prepare) -> unit
+    val p: *Prepare = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    p.on_turn()
+
+/** A prepare watcher on `lp`, stopped. */
+prepare(lp: &Loop = default_loop()) -> Result[&Prepare, Error]
+    var p: &Prepare = Prepare([0; c.PREPARE_WORDS], lp, None, noop, noop)
+
+    checked(c.prepare_init(lp.raw(), p.raw()))?
+
+    p.me = Some(p)
+    c.handle_set_data(p.handle_ptr(), ptr_cast(&*p))
+    Ok(p)
+
+/** Called just after the loop wakes up, before the I/O callbacks that woke it. */
+struct Check
+    private storage: [c.CHECK_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Check]
+    private on_turn: &Fn() -> unit
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Check = ptr_cast(&self.storage[0])
+
+    /** The loop this watcher is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Call `cb` just after each wake-up. Starting a running watcher replaces the callback. */
+    start(*self, cb: &Fn() -> unit) -> Result[unit, Error]
+        self.on_turn = cb
+        checked(c.check_start(self.raw(), &check_turn))
+
+    /** Stop calling it. */
+    stop(*self) -> Result[unit, Error] = checked(c.check_stop(self.raw()))
+end Check
+
+impl Handle for Check
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.on_turn = noop
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+private check_turn(h: *c.Check) -> unit
+    val k: *Check = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    k.on_turn()
+
+/** A check watcher on `lp`, stopped. */
+check(lp: &Loop = default_loop()) -> Result[&Check, Error]
+    var k: &Check = Check([0; c.CHECK_WORDS], lp, None, noop, noop)
+
+    checked(c.check_init(lp.raw(), k.raw()))?
+
+    k.me = Some(k)
+    c.handle_set_data(k.handle_ptr(), ptr_cast(&*k))
+    Ok(k)

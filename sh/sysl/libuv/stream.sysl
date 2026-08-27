@@ -1,0 +1,286 @@
+// What a TCP connection, a named pipe and a terminal have in common: bytes in one direction or
+// both, a listener, and a queue of writes in flight.
+//
+//     conn.read_start((r) -> r match
+//         Data(bytes) -> handle(bytes)
+//         End -> conn.close()
+//         Failed(e) -> print(s"read failed: $e"))
+//
+//     conn.write(greeting)?
+//
+// ## Reading
+//
+// **The bytes handed to the callback are the stream's own buffer**, and they are valid for the call
+// and no longer. A callback that wants to keep them copies them; one that parses them and keeps
+// what it found -- which is what most do -- copies nothing.
+//
+// The buffer is allocated once by `read_start` and reused for every read after it. `buffer_size`
+// decides how much can arrive at a time, and 64 KiB is what libuv itself suggests. A server with
+// thousands of idle connections wants a smaller one, since it is per stream.
+//
+// ## Writing
+//
+// **`write` copies what it is given.** A write outlives the call -- it is queued until the kernel
+// takes it -- and the caller's slice may be a local, so a binding that kept the caller's storage
+// would be handing libuv a pointer into a frame that has gone. The copy is released when the write
+// completes, which is where the callback runs.
+//
+// `try_write` is the one that does not: it writes what the kernel will take right now and answers
+// how much, without queueing anything. That is the fast path for a program that is willing to
+// handle a partial write itself.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.slices.as_mut_ptr
+import sysl.slices.as_ptr
+
+/** What arrived on a stream: some bytes, the end of it, or a failure.
+ *
+ * **The end is not a failure**, which is why it is a variant of its own -- a peer closing its half
+ * of a connection is the ordinary way a request ends. `Failed` is a broken connection, a reset, or
+ * running out of memory for the read.
+ */
+enum Read
+    Data(bytes: []const u8)
+    End
+    Failed(e: Error)
+
+/** The callbacks and the buffer every stream carries. It is a field of the concrete handle rather
+ * than a thing of its own, so it lives and dies with it.
+ *
+ * **This is plumbing rather than a program's business.** It is public only because `Stream` names
+ * it, and a trait cannot hide a member from the type that implements it.
+ */
+struct StreamState
+    on_read: &Fn(Read) -> unit
+    on_connection: &Fn() -> unit
+    buffer: []u8
+
+// A stream that has never read and never listened.
+private[libuv] fresh_stream_state() -> StreamState = StreamState(ignore_read, noop, [0; 0])
+
+private[libuv] ignore_read(r: Read) -> unit = ()
+
+private[libuv] ignore_status(r: Result[unit, Error]) -> unit = ()
+
+// Bytes of our own, since what a caller passed may be a local and a write outlives the call.
+private copy_of(bytes: []const u8) -> []u8
+    var out: []u8 = [0; bytes.len]
+
+    for i in 0..<bytes.len do out[i] = bytes[i]
+
+    out
+
+/** A handle that carries bytes. `Tcp`, `Pipe` and `Tty` are the three, and everything here is
+ * written once for all of them.
+ *
+ * **Two of its members are this package's plumbing rather than a program's business** --
+ * `stream_ptr` and `stream_state` are how the shared operations reach the concrete handle. A trait
+ * cannot hide a member from the type that implements it, and there is nothing useful to do with
+ * either.
+ */
+trait Stream: Handle
+    /** The address libuv knows this stream by. */
+    stream_ptr(*self) -> *c.Stream
+
+    /** Where this stream keeps its read callback, its connection callback and its buffer. */
+    stream_state(*self) -> *StreamState
+
+    /** Whether the peer's half is still open. */
+    is_readable(*self) -> bool = c.is_readable(self.stream_ptr()) != 0
+
+    /** Whether this half is still open. */
+    is_writable(*self) -> bool = c.is_writable(self.stream_ptr()) != 0
+
+    /** How many bytes are queued and not yet handed to the kernel. This is the number a program
+     * watches to decide it is producing faster than the peer can take, which is the whole of
+     * back-pressure on a stream.
+     */
+    write_queue_size(*self) -> usize = c.stream_get_write_queue_size(self.stream_ptr())
+
+    /** Start reading, calling `cb` with everything that arrives until `read_stop` or a failure.
+     *
+     * `buffer_size` is how much can arrive in one call, allocated once and reused. Calling
+     * `read_start` again replaces the callback, and reallocates only if the size changed.
+     *
+     * **The slice a `Data` carries is the buffer**, so it is valid for the call and not after it.
+     */
+    read_start(*self, cb: &Fn(Read) -> unit, buffer_size: usize = 65536) -> Result[unit, Error]
+        val st = self.stream_state()
+
+        st.on_read = cb
+
+        if st.buffer.len != buffer_size then st.buffer = [0; buffer_size]
+
+        checked(c.read_start(self.stream_ptr(), &stream_alloc[Self], &stream_read[Self]))
+
+    /** Stop reading. The callback and the buffer are kept, so `read_start` can resume cheaply. */
+    read_stop(*self) -> Result[unit, Error] = checked(c.read_stop(self.stream_ptr()))
+
+    /** Start accepting connections, calling `cb` once per connection waiting to be accepted.
+     *
+     * `backlog` is how many the kernel may queue before it starts refusing; 128 is the usual
+     * answer. The callback's job is to call `accept`, which is on the concrete type because only it
+     * knows what kind of stream comes out.
+     */
+    listen(*self, backlog: int, cb: &Fn() -> unit) -> Result[unit, Error]
+        self.stream_state().on_connection = cb
+        checked(c.listen(self.stream_ptr(), i32(backlog), &stream_connection[Self]))
+
+    /** Queue `bytes` to be written, and call `cb` when they have been -- or when the write failed.
+     *
+     * **The bytes are copied**, so the caller's slice need not outlive the call. `Ok` here means
+     * the write was queued, not that it happened; that is what the callback is for.
+     */
+    write(*self, bytes: []const u8,
+          cb: &Fn(Result[unit, Error]) -> unit = ignore_status) -> Result[unit, Error]
+        var w: &WriteReq = WriteReq([0; c.WRITE_WORDS], [0; c.BUF_WORDS], copy_of(bytes), None, cb)
+
+        w.me = Some(w)
+        c.buf_set(w.buf(), as_mut_ptr(w.data), w.data.len)
+        c.req_set_data(ptr_cast(w.req()), ptr_cast(&*w))
+
+        val r = c.write(w.req(), self.stream_ptr(), w.buf(), 1, &write_done)
+
+        if r < 0
+            w.me = None
+            return Err(Error(r))
+
+        Ok(())
+
+    /** Write what the kernel will take right now, and answer how many bytes that was.
+     *
+     * Nothing is queued and nothing is copied, so this never blocks and never allocates -- and it
+     * may write **less** than it was given, or answer `EAGAIN` having written nothing. A caller
+     * that cannot handle a short write wants `write`.
+     */
+    try_write(*self, bytes: []const u8) -> Result[usize, Error]
+        var b: [c.BUF_WORDS]u64 = [0; c.BUF_WORDS]
+        val p: *c.Buf = ptr_cast(&b[0])
+
+        c.buf_set(p, as_ptr(bytes), bytes.len)
+        counted(isize(c.try_write(self.stream_ptr(), p, 1)))
+
+    /** Close this half of the stream once everything queued has been written, and call `cb` when
+     * the peer has been told.
+     *
+     * This is the half-close a protocol uses to say "I have finished sending, and I am still
+     * listening". It is not `close`, which ends the handle.
+     */
+    shutdown(*self, cb: &Fn(Result[unit, Error]) -> unit = ignore_status) -> Result[unit, Error]
+        var s: &ShutdownReq = ShutdownReq([0; c.SHUTDOWN_WORDS], None, cb)
+
+        s.me = Some(s)
+        c.req_set_data(ptr_cast(s.req()), ptr_cast(&*s))
+
+        val r = c.shutdown(s.req(), self.stream_ptr(), &shutdown_done)
+
+        if r < 0
+            s.me = None
+            return Err(Error(r))
+
+        Ok(())
+
+    /** Make writes on this stream block until the kernel takes them, which turns `write` into
+     * something that cannot queue and cannot fail with `EAGAIN`.
+     *
+     * **Only worth reaching for on a pipe to a child process**, and libuv's own documentation says
+     * so: a blocking write on a socket blocks the whole loop.
+     */
+    set_blocking(*self, blocking: bool) -> Result[unit, Error] =
+        checked(c.stream_set_blocking(self.stream_ptr(), if blocking then 1 else 0))
+end Stream
+
+// ## The trampolines
+//
+// Each of these is instantiated once per stream type. libuv hands back the handle it was given, and
+// `set_data` put the address of the sysl handle there when it was created -- so reading the type
+// parameter off it is that promise and nothing more.
+
+private stream_alloc[S: Stream](h: *c.Handle, suggested: usize, buf: *c.Buf) -> unit
+    val s: *S = ptr_cast(c.handle_get_data(h))
+    val st = s.stream_state()
+
+    c.buf_set(buf, as_mut_ptr(st.buffer), st.buffer.len)
+
+private stream_read[S: Stream](h: *c.Stream, nread: isize, buf: *c.Buf) -> unit
+    val s: *S = ptr_cast(c.handle_get_data(ptr_cast(h)))
+    val st = s.stream_state()
+
+    // Zero is libuv saying "nothing this time, try again", which is not an event a program has any
+    // use for -- the callback is not called for it.
+    if nread > 0
+        st.on_read(Data(st.buffer[0..<usize(nread)]))
+    else if nread < 0
+        val code = i32(nread)
+
+        st.on_read(if code == EOF then End else Failed(Error(code)))
+
+private stream_connection[S: Stream](h: *c.Stream, status: i32) -> unit
+    val s: *S = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    // A failed connection is reported to the read callback if there is one, since there is nothing
+    // to accept and the listener's callback has no way to carry a failure.
+    if status < 0
+        s.stream_state().on_read(Failed(Error(status)))
+    else
+        s.stream_state().on_connection()
+
+// ## The requests
+//
+// A write, a shutdown and a connect each need storage that outlives the call that started them, and
+// each holds a reference to itself until libuv is finished with it -- the same arrangement a handle
+// uses, for the same reason.
+
+private struct WriteReq
+    storage: [c.WRITE_WORDS]u64
+    bufs: [c.BUF_WORDS]u64
+    data: []u8
+    me: Option[&WriteReq]
+    on_done: &Fn(Result[unit, Error]) -> unit
+
+    req(*self) -> *c.Write = ptr_cast(&self.storage[0])
+    buf(*self) -> *c.Buf = ptr_cast(&self.bufs[0])
+
+private write_done(req: *c.Write, status: i32) -> unit
+    val w: *WriteReq = ptr_cast(c.req_get_data(ptr_cast(req)))
+    val cb = w.on_done
+
+    w.on_done = ignore_status
+    w.data = [0; 0]
+    w.me = None
+
+    cb(checked(status))
+
+private struct ShutdownReq
+    storage: [c.SHUTDOWN_WORDS]u64
+    me: Option[&ShutdownReq]
+    on_done: &Fn(Result[unit, Error]) -> unit
+
+    req(*self) -> *c.Shutdown = ptr_cast(&self.storage[0])
+
+private shutdown_done(req: *c.Shutdown, status: i32) -> unit
+    val s: *ShutdownReq = ptr_cast(c.req_get_data(ptr_cast(req)))
+    val cb = s.on_done
+
+    s.on_done = ignore_status
+    s.me = None
+
+    cb(checked(status))
+
+private[libuv] struct ConnectReq
+    storage: [c.CONNECT_WORDS]u64
+    me: Option[&ConnectReq]
+    on_done: &Fn(Result[unit, Error]) -> unit
+
+    req(*self) -> *c.Connect = ptr_cast(&self.storage[0])
+
+private[libuv] connect_done(req: *c.Connect, status: i32) -> unit
+    val k: *ConnectReq = ptr_cast(c.req_get_data(ptr_cast(req)))
+    val cb = k.on_done
+
+    k.on_done = ignore_status
+    k.me = None
+
+    cb(checked(status))

@@ -1,0 +1,180 @@
+// TCP, both ends of it.
+//
+//     val server = tcp()?
+//
+//     server.bind(ip4("0.0.0.0", 8080)?)?
+//     server.listen(128, () ->
+//         val conn = server.accept().expect("a connection")
+//
+//         conn.read_start((r) -> r match
+//             Data(bytes) -> conn.write(bytes)
+//             End -> conn.close()
+//             Failed(_) -> conn.close()))
+//
+//     default_loop().run()?
+//
+// and the other end:
+//
+//     val client = tcp()?
+//
+//     client.connect(ip4("127.0.0.1", 8080)?, (r) ->
+//         r match
+//             Ok(_) -> client.write(request)
+//             Err(e) -> print(s"cannot connect: $e"))
+//
+// **A listener and a connection are the same type**, which is TCP's own arrangement rather than a
+// simplification: `accept` produces a handle that is connected and has never listened, and `bind`
+// and `listen` are what the other one had done to it.
+//
+// Everything about reading and writing is in `Stream`, which this shares with pipes and terminals.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+/** A TCP socket -- a listener, a connection, or a handle that is neither yet. */
+struct Tcp
+    private storage: [c.TCP_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Tcp]
+    private st: StreamState
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Tcp = ptr_cast(&self.storage[0])
+
+    /** The loop this socket is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Take the local address. `EADDRINUSE` when something else has it, which is the failure a
+     * server reports rather than crashes on.
+     *
+     * A port of `0` asks the kernel to pick one, and `sockname` is how to find out which.
+     * `TCP_IPV6ONLY` is the one flag, and only means anything for a v6 address.
+     */
+    bind(*self, addr: Address, flags: u32 = 0) -> Result[unit, Error]
+        var a = addr
+
+        checked(c.tcp_bind(self.raw(), a.raw(), flags))
+
+    /** Connect to `addr`, and call `cb` when the attempt has finished one way or the other.
+     *
+     * `Ok` from this call means the attempt was started. Whether it succeeded is what the callback
+     * carries -- `ECONNREFUSED`, `ETIMEDOUT` and `ENETUNREACH` all arrive there.
+     */
+    connect(*self, addr: Address,
+            cb: &Fn(Result[unit, Error]) -> unit = ignore_status) -> Result[unit, Error]
+        var a = addr
+        var k: &ConnectReq = ConnectReq([0; c.CONNECT_WORDS], None, cb)
+
+        k.me = Some(k)
+        c.req_set_data(ptr_cast(k.req()), ptr_cast(&*k))
+
+        val r = c.tcp_connect(k.req(), self.raw(), a.raw(), &connect_done)
+
+        if r < 0
+            k.me = None
+            return Err(Error(r))
+
+        Ok(())
+
+    /** Take the next connection off the queue.
+     *
+     * Called from the callback `listen` was given, and **once per call of it**: libuv guarantees
+     * exactly one connection is waiting each time, so a loop calling this until it fails is wrong.
+     *
+     * What comes back is a connected socket on the same loop, ready to be read from and written to.
+     */
+    accept(*self) -> Result[&Tcp, Error]
+        val client = tcp(self.lp)?
+        val r = c.accept(self.stream_ptr(), client.stream_ptr())
+
+        if r < 0
+            client.close()
+            return Err(Error(r))
+
+        Ok(client)
+
+    /** Turn Nagle's algorithm off, so a small write goes out now rather than waiting to be joined
+     * to the next one. What an interactive protocol wants and a bulk transfer does not.
+     */
+    nodelay(*self, on: bool) -> Result[unit, Error] =
+        checked(c.tcp_nodelay(self.raw(), if on then 1 else 0))
+
+    /** Ask the kernel to probe an idle connection after `delay` seconds, so that a peer that went
+     * away without saying so is eventually noticed.
+     */
+    keepalive(*self, on: bool, delay: int = 60) -> Result[unit, Error] =
+        checked(c.tcp_keepalive(self.raw(), if on then 1 else 0, u32(delay)))
+
+    /** Whether several processes sharing this listener may each accept at once. On by default,
+     * which spreads connections across them; turning it off gives better locality at the cost of
+     * balance. Windows only -- a no-op here.
+     */
+    simultaneous_accepts(*self, on: bool) -> Result[unit, Error] =
+        checked(c.tcp_simultaneous_accepts(self.raw(), if on then 1 else 0))
+
+    /** This end's address. After a `bind` with port `0`, this is how to learn the port. */
+    sockname(*self) -> Result[Address, Error]
+        var a = blank_address()
+        var len = i32(c.SOCKADDR_WORDS * 8)
+        val r = c.tcp_getsockname(self.raw(), a.raw(), &len)
+
+        if r < 0 then Err(Error(r)) else Ok(a)
+
+    /** The other end's address. `ENOTCONN` for a socket that is not connected. */
+    peername(*self) -> Result[Address, Error]
+        var a = blank_address()
+        var len = i32(c.SOCKADDR_WORDS * 8)
+        val r = c.tcp_getpeername(self.raw(), a.raw(), &len)
+
+        if r < 0 then Err(Error(r)) else Ok(a)
+
+    /** Close the connection with a reset rather than a graceful shutdown, and then close the
+     * handle. The peer sees the connection break instead of end, which is what a server does to a
+     * client that is misbehaving.
+     */
+    close_reset(*self, cb: &Fn() -> unit = noop) -> Result[unit, Error]
+        self.on_closed = cb
+        checked(c.tcp_close_reset(self.raw(), &handle_closed[Tcp]))
+
+    /** Adopt a socket the program got from somewhere else -- inherited, or made by hand.
+     *
+     * **libuv owns it afterwards**, and closing it any other way breaks the handle.
+     */
+    open(*self, fd: i32) -> Result[unit, Error] = checked(c.tcp_open(self.raw(), fd))
+end Tcp
+
+impl Handle for Tcp
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.st.on_read = ignore_read
+        self.st.on_connection = noop
+        self.st.buffer = [0; 0]
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+impl Stream for Tcp
+    stream_ptr(*self) -> *c.Stream = ptr_cast(&self.storage[0])
+
+    stream_state(*self) -> *StreamState = &self.st
+
+/** A TCP socket on `lp`, bound to nothing and connected to nothing.
+ *
+ * The same call makes a listener and a client; what it becomes is decided by whether `bind` and
+ * `listen` or `connect` is called on it.
+ */
+tcp(lp: &Loop = default_loop()) -> Result[&Tcp, Error]
+    var t: &Tcp = Tcp([0; c.TCP_WORDS], lp, None, fresh_stream_state(), noop)
+
+    checked(c.tcp_init(lp.raw(), t.raw()))?
+
+    t.me = Some(t)
+    c.handle_set_data(t.handle_ptr(), ptr_cast(&*t))
+    Ok(t)

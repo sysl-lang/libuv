@@ -1,0 +1,103 @@
+// Signals, delivered as ordinary callbacks on the loop's thread.
+//
+//     val s = signal()?
+//
+//     s.start(SIGINT, () ->
+//         print("shutting down")
+//         server.close()
+//         s.close())
+//
+// **This is not a signal handler.** libuv catches the signal in whatever way the platform allows
+// and delivers it to the loop, so the callback is an ordinary function running at an ordinary time
+// -- nothing about it is restricted to what is async-signal-safe, and it may allocate, print and
+// close handles freely.
+//
+// **A watcher does not stop the default.** Starting one on `SIGINT` replaces the default action for
+// the process, which is what a program catching Ctrl-C wants. `SIGKILL` and `SIGSTOP` cannot be
+// caught at all and answer `EINVAL`.
+//
+// **Several watchers may watch one signal**, on one loop or on several, and every one of them is
+// called.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+/** A signal watcher. One at a time: starting it again watches the new signal instead. */
+struct Signal
+    private storage: [c.SIGNAL_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Signal]
+    private on_signal: &Fn(i32) -> unit
+    private on_closed: &Fn() -> unit
+    private number: i32
+
+    private raw(*self) -> *c.Signal = ptr_cast(&self.storage[0])
+
+    /** The loop this watcher is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** The signal being watched, or `0` if none is. */
+    watching(*self) -> i32 = self.number
+
+    /** Call `cb` every time `signum` arrives, until stopped.
+     *
+     * The callback is handed the number, which matters for a program that starts one watcher, stops
+     * it and starts it on something else -- the callback it was given may outlive the number it was
+     * given for.
+     */
+    start(*self, signum: i32, cb: &Fn(i32) -> unit) -> Result[unit, Error]
+        self.on_signal = cb
+        self.number = signum
+        checked(c.signal_start(self.raw(), &signal_raised, signum))
+
+    /** The same, for one arrival only: the watcher stops itself before the callback runs. */
+    start_once(*self, signum: i32, cb: &Fn(i32) -> unit) -> Result[unit, Error]
+        self.on_signal = cb
+        self.number = signum
+        checked(c.signal_start_oneshot(self.raw(), &signal_raised, signum))
+
+    /** Stop watching. The process goes back to whatever it did before, for this watcher's share. */
+    stop(*self) -> Result[unit, Error]
+        self.number = 0
+        checked(c.signal_stop(self.raw()))
+
+end Signal
+
+impl Handle for Signal
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.on_signal = noop_signal
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+private noop_signal(signum: i32) -> unit = ()
+
+private signal_raised(h: *c.Signal, signum: i32) -> unit
+    val s: *Signal = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    s.on_signal(signum)
+
+/** A signal watcher on `lp`, watching nothing yet. */
+signal(lp: &Loop = default_loop()) -> Result[&Signal, Error]
+    var s: &Signal = Signal([0; c.SIGNAL_WORDS], lp, None, noop_signal, noop, 0)
+
+    checked(c.signal_init(lp.raw(), s.raw()))?
+
+    s.me = Some(s)
+    c.handle_set_data(s.handle_ptr(), ptr_cast(&*s))
+    Ok(s)
+
+/** Send a signal to a process by pid, which is `kill(2)` and needs no loop and no handle.
+ *
+ * `signum` of `0` sends nothing and reports whether the process exists and could be signalled,
+ * which is the ordinary way to ask.
+ */
+kill(pid: i32, signum: i32) -> Result[unit, Error] = checked(c.kill(pid, signum))

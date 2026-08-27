@@ -1,0 +1,109 @@
+// A socket address: a family, an IP and a port, in whatever storage the platform's `sockaddr` for
+// that family needs.
+//
+//     val a = ip4("0.0.0.0", 8080)?
+//     val b = ip6("::1", 8080)?
+//
+//     print(s"$a")        // 0.0.0.0:8080
+//
+// **This is an ordinary value**, not a handle: it is a copy of some bytes with nothing pointing at
+// it, so it goes in a `var`, is passed by value, and is returned. Everything else in this package
+// is a `&T` for a reason that does not apply here.
+//
+// The storage is a `sockaddr_storage`, which is the union big enough for either family -- so one
+// type answers for both and a v6 address is not a different sysl type from a v4 one.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.text.cstring
+import sysl.text.from_cstring
+
+/** An IPv4 or IPv6 address with a port. */
+struct Address
+    private storage: [c.SOCKADDR_WORDS]u64
+
+    // Where libuv is to WRITE an address. It takes `*self` because it is the mutable half, and a
+    // reader must not use it: everything below reads its own copy instead, which is what lets an
+    // address be asked about without being a `var`.
+    private[libuv] raw(*self) -> *c.SockAddr = ptr_cast(&self.storage[0])
+
+    /** `AF_INET` or `AF_INET6`. */
+    family(self) -> i32 = c.sockaddr_family(ptr_cast(&self.storage[0]))
+
+    /** The port, in the order a person reads it rather than the order the wire carries it. */
+    port(self) -> int = int(c.sockaddr_port(ptr_cast(&self.storage[0])))
+
+    /** The address on its own, with no port -- `"127.0.0.1"`, `"::1"`. */
+    ip(self) -> string
+        var buf: [64]u8 = [0; 64]
+
+        if c.ip_name(ptr_cast(&self.storage[0]), &buf[0], 64) < 0 then return ""
+
+        from_cstring(&buf[0]).unwrap_or("")
+end Address
+
+/** An address renders the way a person writes one: `host:port`, with a v6 host in brackets so that
+ * the colons in it are not read as the separator.
+ */
+impl Display for Address
+    display(self, out: *Writer, fmt: FormatSpec)
+        val host = self.ip()
+        var text = s"$host:${str(self.port())}"
+
+        if self.family() == AF_INET6 then text = s"[$host]:${str(self.port())}"
+
+        display_str(text, out, fmt)
+
+/** Two addresses are equal when they name the same host and port in the same family. */
+impl Eq for Address
+    eq(self, rhs: Address) -> bool =
+        self.family() == rhs.family() && self.port() == rhs.port() && self.ip() == rhs.ip()
+
+/** An IPv4 address from dotted quad and a port. `EINVAL` for text that is not one -- **this does not
+ * resolve a name**, which is what `resolve` is for.
+ */
+ip4(host: string, port: int) -> Result[Address, Error]
+    var a = Address([0; c.SOCKADDR_WORDS])
+    val h = cstring(host)
+    val r = c.ip4_addr(h.ptr, i32(port), a.raw())
+
+    if r < 0 then Err(Error(r)) else Ok(a)
+
+/** An IPv6 address and a port, with the same rule: text only, no lookup. A scope may be written the
+ * way the platform writes one, `fe80::1%en0`.
+ */
+ip6(host: string, port: int) -> Result[Address, Error]
+    var a = Address([0; c.SOCKADDR_WORDS])
+    val h = cstring(host)
+    val r = c.ip6_addr(h.ptr, i32(port), a.raw())
+
+    if r < 0 then Err(Error(r)) else Ok(a)
+
+/** An address of either family, decided by whether the text parses as one. This is what a program
+ * reading a host out of a configuration file wants, since it need not care which it was given.
+ */
+ip(host: string, port: int) -> Result[Address, Error]
+    ip4(host, port) match
+        Ok(a) -> Ok(a)
+        Err(_) -> ip6(host, port)
+
+// **The two above are written without `?` on purpose, and it is a workaround.** An `Address` is a
+// `sockaddr_storage`, which is 128 bytes here -- and a `?` in a function whose result is that large
+// is returned through an `sret` out-parameter while the early return `?` emits is written as a
+// direct one. clang refuses the IR, naming a temporary file and the word `void`, which reads as a
+// toolchain fault rather than as anything to do with the sysl. Card `0304`; put the `?` back when it
+// closes.
+
+// Storage for an address libuv is about to fill in -- a peer's, or the local end of a socket.
+private[libuv] blank_address() -> Address = Address([0; c.SOCKADDR_WORDS])
+
+// A copy of whatever libuv or the platform left at an address, into storage of our own. libuv
+// answers a peer's address into a `sockaddr_storage`, and this is how one of those becomes a value.
+private[libuv] address_at(p: *c.SockAddr) -> Address
+    var a = Address([0; c.SOCKADDR_WORDS])
+    val src: *u64 = ptr_cast(p)
+
+    for i in 0..<c.SOCKADDR_WORDS do a.storage[i] = src[i]
+
+    a

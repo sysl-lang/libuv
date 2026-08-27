@@ -99,7 +99,7 @@ trait Handle
     fileno(*self) -> Result[i32, Error]
         var fd: i32 = -1
 
-        check(c.fileno(self.handle_ptr(), &fd))?
+        checked(c.fileno(self.handle_ptr(), &fd))?
         Ok(fd)
 
     /** How much the operating system will buffer on the way out, in bytes. `0` asks; anything else
@@ -108,14 +108,14 @@ trait Handle
     send_buffer_size(*self, value: i32 = 0) -> Result[i32, Error]
         var v = value
 
-        check(c.send_buffer_size(self.handle_ptr(), &v))?
+        checked(c.send_buffer_size(self.handle_ptr(), &v))?
         Ok(v)
 
     /** The same, on the way in. */
     recv_buffer_size(*self, value: i32 = 0) -> Result[i32, Error]
         var v = value
 
-        check(c.recv_buffer_size(self.handle_ptr(), &v))?
+        checked(c.recv_buffer_size(self.handle_ptr(), &v))?
         Ok(v)
 
     /** Close the handle, and call `cb` once libuv is finished with it.
@@ -139,7 +139,7 @@ end Handle
 // The one close callback, instantiated per handle type. libuv hands back the address it was given,
 // which is the address of the sysl handle -- so reading the type parameter off it is the promise
 // `set_data` made at creation and nothing more.
-private handle_closed[H: Handle](h: *c.Handle) -> unit
+private[libuv] handle_closed[H: Handle](h: *c.Handle) -> unit
     val p: *H = ptr_cast(c.handle_get_data(h))
 
     p.finish_close()

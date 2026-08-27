@@ -98,14 +98,14 @@ struct Loop
      * The ordinary way to release a loop is to close every handle on it and let `run` return; this
      * is the call that then frees what libuv allocated inside it.
      */
-    close(*self) -> Result[unit, Error] = check(c.loop_close(self.p))
+    close(*self) -> Result[unit, Error] = checked(c.loop_close(self.p))
 
     /** Prepare this loop to be used again in a process that has just forked.
      *
      * Only the child calls it, and only before it does anything else with the loop. Some backends
      * carry state a `fork` invalidates, and this is what rebuilds it.
      */
-    fork(*self) -> Result[unit, Error] = check(c.loop_fork(self.p))
+    fork(*self) -> Result[unit, Error] = checked(c.loop_fork(self.p))
 end Loop
 
 /** libuv's own loop, which is what a single-threaded program should use.
@@ -125,5 +125,5 @@ new_loop() -> Result[&Loop, Error]
 
     l.p = ptr_cast(as_mut_ptr(l.storage))
 
-    check(c.loop_init(l.p))?
+    checked(c.loop_init(l.p))?
     Ok(l)

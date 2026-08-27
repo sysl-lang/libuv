@@ -18,6 +18,7 @@ module sh.sysl.libuv
 // its block count.
 
 import sh.sysl.libuv.c
+import sysl.buf.{Buf, buf}
 
 // -- Layout ---------------------------------------------------------------------------------------
 
@@ -75,13 +76,13 @@ error_equality()
     assert_eq(Error(EOF), Error(EOF))
     assert(Error(EOF) != Error(EPIPE), "two codes are two errors")
 
-@test("check turns libuv's convention into a Result")
-check_is_the_convention()
-    assert(check(0).is_ok(), "zero is success")
-    assert(check(1).is_ok(), "and so is anything above it")
-    assert_eq(check(EOF).unwrap_err(), Error(EOF))
-    assert_eq(check_count(-4095).unwrap_err().code, EOF)
-    assert_eq(check_count(17).unwrap(), 17)
+@test("checked turns libuv's convention into a Result")
+checked_is_the_convention()
+    assert(checked(0).is_ok(), "zero is success")
+    assert(checked(1).is_ok(), "and so is anything above it")
+    assert_eq(checked(EOF).unwrap_err(), Error(EOF))
+    assert_eq(counted(-4095).unwrap_err().code, EOF)
+    assert_eq(counted(17).unwrap(), 17)
 
 // -- The loop -------------------------------------------------------------------------------------
 
@@ -190,9 +191,165 @@ unref_lets_the_loop_end()
     t.close()
     lp.run().expect("the loop ran")
 
+// -- Addresses ------------------------------------------------------------------------------------
+
+@test("an address is parsed, and reads back as what was written")
+addresses()
+    val a = ip4("127.0.0.1", 8080).expect("a v4 address")
+
+    assert_eq(a.family(), AF_INET)
+    assert_eq(a.ip(), "127.0.0.1")
+    assert_eq(a.port(), 8080)
+    assert_eq(s"$a", "127.0.0.1:8080")
+
+    val b = ip6("::1", 443).expect("a v6 address")
+
+    assert_eq(b.family(), AF_INET6)
+    assert_eq(b.ip(), "::1")
+    assert_eq(b.port(), 443)
+    assert_eq(s"$b", "[::1]:443")
+
+@test("text that is not an address is refused rather than guessed at")
+bad_addresses()
+    assert(ip4("not an address", 80).is_err(), "a name is not a dotted quad")
+    assert(ip4("::1", 80).is_err(), "and neither is a v6 address")
+    assert(ip6("127.0.0.1", 80).is_err(), "nor the other way round")
+
+@test("ip takes either family, deciding by what parses")
+either_family()
+    val a = ip("127.0.0.1", 1).expect("v4")
+    val b = ip("::1", 1).expect("v6")
+
+    assert_eq(a.family(), AF_INET)
+    assert_eq(b.family(), AF_INET6)
+    assert(ip("nonsense", 1).is_err(), "and neither, for something that is neither")
+
+@test("addresses compare by what they name")
+address_equality()
+    assert_eq(ip4("1.2.3.4", 9).unwrap(), ip4("1.2.3.4", 9).unwrap())
+    assert(ip4("1.2.3.4", 9).unwrap() != ip4("1.2.3.4", 10).unwrap(), "the port counts")
+    assert(ip4("1.2.3.4", 9).unwrap() != ip4("1.2.3.5", 9).unwrap(), "and so does the host")
+
+// -- TCP ------------------------------------------------------------------------------------------
+
+// The whole arrangement in one test: a listener, a connection accepted out of a callback, bytes
+// written from one end and read at the other, and every handle closed so that `run` returns.
+//
+// **Nothing here binds a fixed port.** Port 0 asks the kernel for a free one and `sockname` reads
+// back which, so the test cannot fail because something else on the machine holds 8080.
+@test("bytes written at one end of a connection arrive at the other")
+tcp_echo()
+    val lp = default_loop()
+    val server = tcp(lp).expect("a socket")
+
+    server.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+
+    val where = server.sockname().expect("the port the kernel picked")
+    val got: &Bytes = Bytes(buf())
+
+    server.listen(16, () ->
+        val conn = server.accept().expect("a connection")
+
+        conn.read_start((r) -> r match
+            Data(bytes) ->
+                conn.write(bytes)
+                conn.shutdown()
+            End -> conn.close()
+            Failed(_) -> conn.close()))
+
+    val client = tcp(lp).expect("a socket")
+
+    client.connect(where, (r) ->
+        r.expect("the connection was made")
+        client.write([104, 105])
+        client.read_start((r) -> r match
+            Data(bytes) -> got.add(bytes)
+            End ->
+                client.close()
+                server.close()
+            Failed(_) ->
+                client.close()
+                server.close()))
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.bytes.len(), 2)
+    assert_eq(got.bytes[0], 104)
+    assert_eq(got.bytes[1], 105)
+
+@test("a socket that was never connected has no peer")
+no_peer()
+    val t = tcp().expect("a socket")
+
+    assert(t.peername().is_err(), "nothing is connected")
+    assert(!t.is_readable(), "and nothing is readable")
+
+    t.close()
+    default_loop().run().expect("the loop ran")
+
+@test("a socket may only be bound once, and the second attempt says so")
+bound_once()
+    val lp = default_loop()
+    val t = tcp(lp).expect("a socket")
+
+    t.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+    assert_eq(t.bind(ip4("127.0.0.1", 0).expect("an address")).unwrap_err(), Error(EINVAL))
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+@test("the kernel picks a port for 0, and sockname reads back which")
+ephemeral_port()
+    val lp = default_loop()
+    val t = tcp(lp).expect("a socket")
+
+    t.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+
+    val where = t.sockname().expect("the port")
+
+    assert(where.port() > 0, "the kernel picked one")
+    assert_eq(where.ip(), "127.0.0.1")
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+@test("connecting to a port nothing is listening on fails in the callback, not at the call")
+refused()
+    val lp = default_loop()
+    val client = tcp(lp).expect("a socket")
+    val seen: &Held = Held(0)
+
+    // A port the kernel handed out and then let go of is the one nothing is listening on.
+    val closed = tcp(lp).expect("a socket")
+
+    closed.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+
+    val where = closed.sockname().expect("the port")
+
+    closed.close()
+    lp.run(RUN_NOWAIT).expect("the close was delivered")
+
+    client.connect(where, (r) ->
+        seen.code = r.unwrap_err().code
+        client.close())
+
+    lp.run().expect("the loop ran")
+    assert(seen.code < 0, "the attempt failed, and it failed in the callback")
+
 // Somewhere for a callback to leave a mark. A closure captures by value, so a counter it is going to
 // increment has to be behind a `&` for the caller to see what happened.
 private struct Counter
     value: int
 
     bump(*self) = self.value += 1
+
+// The same, for a code a callback was handed.
+private struct Held
+    code: i32
+
+// And for the bytes one was handed, which are the stream's buffer and have to be copied to outlive
+// the call that carried them.
+private struct Bytes
+    bytes: Buf[u8]
+
+    add(*self, more: []const u8) = self.bytes.extend(more)
