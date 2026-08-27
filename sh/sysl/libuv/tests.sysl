@@ -58,7 +58,7 @@ req_sizes()
     assert_eq(c.FS_WORDS * 8, round_up(c.req_size(REQ_FS)))
     assert_eq(c.GETADDRINFO_WORDS * 8, round_up(c.req_size(REQ_GETADDRINFO)))
 
-// Bytes to whole words, which is what the `(sizeof(T) + 7) / 8` in the layer below computes.
+// Sink to whole words, which is what the `(sizeof(T) + 7) / 8` in the layer below computes.
 private round_up(n: usize) -> usize = (n + 7) / 8 * 8
 
 // -- Errors ---------------------------------------------------------------------------------------
@@ -245,7 +245,7 @@ tcp_echo()
     server.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
 
     val where = server.sockname().expect("the port the kernel picked")
-    val got: &Bytes = Bytes(buf())
+    val got: &Sink = Sink(buf())
 
     server.listen(16, () ->
         val conn = server.accept().expect("a connection")
@@ -336,6 +336,207 @@ refused()
     lp.run().expect("the loop ran")
     assert(seen.code < 0, "the attempt failed, and it failed in the callback")
 
+// -- Pipes and terminals --------------------------------------------------------------------------
+
+@test("a pipe carries bytes between two ends of itself")
+pipe_echo()
+    val lp = default_loop()
+    val path = mkdtemp_sync("/tmp/libuv-test-XXXXXX").expect("a temporary directory") + "/sock"
+    val server = pipe(false, lp).expect("a pipe")
+
+    server.bind(path).expect("bound")
+
+    val got: &Sink = Sink(buf())
+
+    server.listen(4, () ->
+        val conn = server.accept().expect("a connection")
+
+        conn.read_start((r) -> r match
+            Data(bytes) ->
+                conn.write(bytes)
+                conn.shutdown()
+            End -> conn.close()
+            Failed(_) -> conn.close()))
+
+    val client = pipe(false, lp).expect("a pipe")
+
+    client.connect(path, (r) ->
+        r.expect("connected")
+        client.write([7, 8, 9])
+        client.read_start((r) -> r match
+            Data(bytes) -> got.add(bytes)
+            End ->
+                client.close()
+                server.close()
+            Failed(_) ->
+                client.close()
+                server.close()))
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.bytes.len(), 3)
+    assert_eq(got.bytes[2], 9)
+
+    // libuv unlinks a bound pipe when the handle closes, which is worth pinning: a binding that
+    // removed it itself would be racing the library, and one that documented the opposite would
+    // have every server that used it leaking a socket file per restart.
+    assert(stat_sync(path).is_err(), "closing the listener took the socket file with it")
+
+    rmdir_sync(dir_of(path)).expect("the temporary directory went")
+
+@test("a descriptor that is not a terminal is refused rather than opened")
+tty_needs_a_terminal()
+    // The test runner's output is a pipe, so this is the failing case wherever the suite runs.
+    val fd = open_sync("/dev/null", O_RDWR).expect("a file")
+
+    assert(tty(fd.descriptor()).is_err(), "/dev/null is not a terminal")
+    assert_eq(guess_handle(fd.descriptor()), HANDLE_FILE)
+
+    fd.close_sync().expect("closed")
+
+// -- Name resolution ------------------------------------------------------------------------------
+
+// **Localhost, because a test that reaches the network is a test that fails on a train.** The name
+// is in the hosts file on every machine this could run on, so the resolver answers without asking
+// anybody.
+@test("a name is resolved on the pool and answered on the loop")
+resolve_localhost()
+    val lp = default_loop()
+    val found: &Answers = Answers(0, 0, false)
+
+    resolve("localhost", "80", (r) ->
+        found.done = true
+
+        r match
+            Ok(list) -> found.count = list.len
+            Err(e) -> found.code = e.code, AF_INET, SOCK_STREAM, 0, lp).expect("the lookup started")
+
+    assert(!found.done, "nothing has been answered before the loop runs")
+
+    lp.run().expect("the loop ran")
+
+    assert(found.done, "and the callback ran once it did")
+    assert_eq(found.code, 0)
+    assert(found.count > 0, "localhost resolves to at least one address")
+
+@test("a name that does not resolve fails in the callback")
+resolve_nothing()
+    val lp = default_loop()
+    val found: &Answers = Answers(0, 0, false)
+
+    resolve("no.such.host.invalid", "", (r) ->
+        found.done = true
+
+        r match
+            Ok(list) -> found.count = list.len
+            Err(e) -> found.code = e.code, AF_UNSPEC, SOCK_STREAM, 0, lp).expect("the lookup started")
+
+    lp.run().expect("the loop ran")
+
+    assert(found.done, "the callback ran")
+    assert(found.code < 0, "and it carried a failure")
+
+// -- The file system ------------------------------------------------------------------------------
+
+@test("a file written is a file read back")
+round_trip()
+    val dir = mkdtemp_sync("/tmp/libuv-test-XXXXXX").expect("a temporary directory")
+    val path = dir + "/notes.txt"
+
+    write_file_sync(path, [104, 101, 108, 108, 111]).expect("written")
+
+    val back = read_file_sync(path).expect("read")
+
+    assert_eq(back.len, 5)
+    assert_eq(back[0], 104)
+    assert_eq(back[4], 111)
+
+    val info = stat_sync(path).expect("stat")
+
+    assert_eq(info.size, 5)
+    assert(info.is_file(), "it is a file")
+    assert(!info.is_dir(), "and not a directory")
+
+    unlink_sync(path).expect("removed")
+    assert(stat_sync(path).is_err(), "and it is gone")
+    rmdir_sync(dir).expect("the directory went too")
+
+@test("a path that is not there says so rather than answering nonsense")
+missing_path()
+    assert_eq(stat_sync("/no/such/path/anywhere").unwrap_err(), Error(ENOENT))
+    assert_eq(open_sync("/no/such/path/anywhere").unwrap_err(), Error(ENOENT))
+    assert_eq(access_sync("/no/such/path/anywhere").unwrap_err(), Error(ENOENT))
+
+@test("a directory lists what was put in it")
+listing()
+    val dir = mkdtemp_sync("/tmp/libuv-test-XXXXXX").expect("a temporary directory")
+
+    write_file_sync(dir + "/a", [1]).expect("written")
+    write_file_sync(dir + "/b", [2]).expect("written")
+    mkdir_sync(dir + "/c").expect("made")
+
+    val found = scandir_sync(dir).expect("listed")
+
+    assert_eq(found.len, 3)
+
+    var dirs = 0
+    var files = 0
+
+    for e in found
+        if e.is_dir() then dirs += 1
+        if e.is_file() then files += 1
+
+    assert_eq(dirs, 1)
+    assert_eq(files, 2)
+
+    unlink_sync(dir + "/a").expect("removed")
+    unlink_sync(dir + "/b").expect("removed")
+    rmdir_sync(dir + "/c").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("the asynchronous read answers on the loop and not before")
+async_read_file()
+    val lp = default_loop()
+    val dir = mkdtemp_sync("/tmp/libuv-test-XXXXXX").expect("a temporary directory")
+    val path = dir + "/big.txt"
+
+    write_file_sync(path, [1, 2, 3, 4]).expect("written")
+
+    val got: &Sink = Sink(buf())
+    val state: &Held = Held(0)
+
+    read_file(path, (r) ->
+        r match
+            Ok(bytes) -> got.add(bytes)
+            Err(e) -> state.code = e.code, lp).expect("the read started")
+
+    assert_eq(got.bytes.len(), 0)
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(state.code, 0)
+    assert_eq(got.bytes.len(), 4)
+    assert_eq(got.bytes[3], 4)
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("an asynchronous stat of nothing fails in the callback")
+async_stat_missing()
+    val lp = default_loop()
+    val state: &Held = Held(0)
+
+    stat("/no/such/path/anywhere", (r) ->
+        r match
+            Ok(_) -> state.code = 1
+            Err(e) -> state.code = e.code, lp).expect("the stat started")
+
+    lp.run().expect("the loop ran")
+    assert_eq(state.code, ENOENT)
+
+// The directory a path is in, which is only ever a temporary one made three lines earlier here.
+private dir_of(path: string) -> string = path[0..<path.len - 5]
+
 // Somewhere for a callback to leave a mark. A closure captures by value, so a counter it is going to
 // increment has to be behind a `&` for the caller to see what happened.
 private struct Counter
@@ -347,9 +548,15 @@ private struct Counter
 private struct Held
     code: i32
 
+// And for what a resolver answered.
+private struct Answers
+    count: usize
+    code: i32
+    done: bool
+
 // And for the bytes one was handed, which are the stream's buffer and have to be copied to outlive
 // the call that carried them.
-private struct Bytes
+private struct Sink
     bytes: Buf[u8]
 
     add(*self, more: []const u8) = self.bytes.extend(more)

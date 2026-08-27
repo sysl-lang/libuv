@@ -1,0 +1,664 @@
+// The file system, both ways round.
+//
+// **A file system call blocks**, however fast the disk is, so libuv runs the asynchronous form on
+// its thread pool and answers through the loop. The blocking form is the same call with no callback
+// and is what a program reads its configuration with.
+//
+//     val text = read_file_sync("config.hocon")?               // blocking, and usually right
+//
+//     read_file("big.dat", (r) -> r match                      // on the pool, answered on the loop
+//         Ok(bytes) -> handle(bytes)
+//         Err(e) -> print(s"cannot read: $e"))?
+//
+// **The suffix is Node's**, which is the closest thing libuv has to a convention: the plain name is
+// asynchronous and `_sync` is the one that blocks. A server should reach for the plain one on any
+// path a request waits on, and nobody should reach for it to read a file at startup.
+//
+// **A path is a `string` and is copied for the call.** Neither form keeps the caller's storage.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.text.cstring
+import sysl.text.from_cstring
+
+/** A moment, as the file system records one. */
+struct FileTime
+    seconds: i64
+    nanos: i64
+
+/** What the file system knows about a file.
+ *
+ * The fields are libuv's normalised ones rather than the platform's `struct stat`, so they mean the
+ * same thing on every operating system -- and `birthtime` is real where the platform has one and a
+ * copy of `ctime` where it does not.
+ */
+struct Stat
+    size: u64
+    mode: u64
+    uid: u64
+    gid: u64
+    nlink: u64
+    ino: u64
+    dev: u64
+    atime: FileTime
+    mtime: FileTime
+    ctime: FileTime
+    birthtime: FileTime
+
+    /** An ordinary file. */
+    is_file(self) -> bool = self.mode & S_IFMT == S_IFREG
+
+    /** A directory. */
+    is_dir(self) -> bool = self.mode & S_IFMT == S_IFDIR
+
+    /** A symbolic link, which only `lstat_sync` ever answers -- `stat_sync` follows them. */
+    is_link(self) -> bool = self.mode & S_IFMT == S_IFLNK
+end Stat
+
+/** One entry in a directory. `kind` is one of the `DIRENT_*` constants, and is `DIRENT_UNKNOWN` on
+ * a file system that does not report it -- in which case a `stat_sync` of the entry is the answer.
+ */
+struct Dirent
+    name: string
+    kind: i32
+
+    /** An ordinary file, as far as the directory knows. */
+    is_file(self) -> bool = self.kind == DIRENT_FILE
+
+    /** A directory, as far as the directory knows. */
+    is_dir(self) -> bool = self.kind == DIRENT_DIR
+
+    /** A symbolic link, as far as the directory knows. */
+    is_link(self) -> bool = self.kind == DIRENT_LINK
+end Dirent
+
+/** An open file. It is the operating system's descriptor and nothing more -- **closing it is the
+ * program's job**, and a file left open is a descriptor leaked exactly as it would be in C.
+ */
+struct File
+    private fd: i32
+
+    /** The descriptor, for handing to something outside libuv. */
+    descriptor(self) -> i32 = self.fd
+
+    /** Read into `into`, and answer how many bytes arrived. `0` is the end of the file.
+     *
+     * `offset` of `-1` -- the default -- reads from wherever the file is positioned and moves it
+     * on; anything else reads from there and leaves the position alone.
+     */
+    read_sync(self, into: []u8, offset: i64 = -1) -> Result[usize, Error]
+        var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+        var bufs: [c.BUF_WORDS]u64 = [0; c.BUF_WORDS]
+        val r: *c.Fs = ptr_cast(&req[0])
+        val b: *c.Buf = ptr_cast(&bufs[0])
+
+        c.buf_set(b, as_mut_ptr(into), into.len)
+
+        val n = c.fs_read(default_loop().raw(), r, self.fd, b, 1, offset, null)
+
+        c.fs_req_cleanup(r)
+        counted(isize(n))
+
+    /** Write `bytes`, and answer how many were taken.
+     *
+     * `offset` of `-1` writes at the current position. A short write is possible and is not an
+     * error -- `write_all_sync` is the one that loops.
+     */
+    write_sync(self, bytes: []const u8, offset: i64 = -1) -> Result[usize, Error]
+        var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+        var bufs: [c.BUF_WORDS]u64 = [0; c.BUF_WORDS]
+        val r: *c.Fs = ptr_cast(&req[0])
+        val b: *c.Buf = ptr_cast(&bufs[0])
+
+        c.buf_set(b, as_ptr(bytes), bytes.len)
+
+        val n = c.fs_write(default_loop().raw(), r, self.fd, b, 1, offset, null)
+
+        c.fs_req_cleanup(r)
+        counted(isize(n))
+
+    /** Write all of `bytes`, however many calls that takes. */
+    write_all_sync(self, bytes: []const u8) -> Result[unit, Error]
+        var at: usize = 0
+
+        while at < bytes.len
+            val n = self.write_sync(bytes[at..<bytes.len])?
+
+            if n == 0 then return Err(Error(EIO))
+
+            at += n
+
+        Ok(())
+
+    /** What the file system knows about this file. */
+    stat_sync(self) -> Result[Stat, Error]
+        var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+        val r: *c.Fs = ptr_cast(&req[0])
+        val code = c.fs_fstat(default_loop().raw(), r, self.fd, null)
+        var out = blank_stat()
+
+        if code >= 0 then out = stat_of(c.fs_get_statbuf(r))
+
+        c.fs_req_cleanup(r)
+
+        if code < 0 then Err(Error(code)) else Ok(out)
+
+    /** Cut the file to `length` bytes, or extend it with zeroes. */
+    truncate_sync(self, length: i64) -> Result[unit, Error]
+        var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+        val r: *c.Fs = ptr_cast(&req[0])
+        val code = c.fs_ftruncate(default_loop().raw(), r, self.fd, length, null)
+
+        c.fs_req_cleanup(r)
+        checked(code)
+
+    /** Push everything written so far to the disk, data and metadata both. */
+    flush_sync(self) -> Result[unit, Error]
+        var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+        val r: *c.Fs = ptr_cast(&req[0])
+        val code = c.fs_fsync(default_loop().raw(), r, self.fd, null)
+
+        c.fs_req_cleanup(r)
+        checked(code)
+
+    /** The same, for the data only. Cheaper where the platform distinguishes them. */
+    flush_data_sync(self) -> Result[unit, Error]
+        var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+        val r: *c.Fs = ptr_cast(&req[0])
+        val code = c.fs_fdatasync(default_loop().raw(), r, self.fd, null)
+
+        c.fs_req_cleanup(r)
+        checked(code)
+
+    /** Close the file. A closed `File` must not be used again. */
+    close_sync(self) -> Result[unit, Error]
+        var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+        val r: *c.Fs = ptr_cast(&req[0])
+        val code = c.fs_close(default_loop().raw(), r, self.fd, null)
+
+        c.fs_req_cleanup(r)
+        checked(code)
+end File
+
+// `EIO` is not in `constants.sysl` because nothing acts on it; a short write that made no progress
+// is the one place this package has to name a failure libuv did not report.
+private const EIO: i32 = -5
+
+// A `Stat` with nothing in it, for the paths that have to have something to return before they know
+// whether the call worked.
+private blank_stat() -> Stat
+    val zero = FileTime(0, 0)
+
+    Stat(0, 0, 0, 0, 0, 0, 0, zero, zero, zero, zero)
+
+// libuv's normalised `uv_stat_t`, copied into storage of ours before the request is cleaned up.
+private stat_of(s: *c.Stat) -> Stat
+    Stat(s.st_size, s.st_mode, s.st_uid, s.st_gid, s.st_nlink, s.st_ino, s.st_dev,
+         FileTime(i64(s.st_atim.tv_sec), i64(s.st_atim.tv_nsec)),
+         FileTime(i64(s.st_mtim.tv_sec), i64(s.st_mtim.tv_nsec)),
+         FileTime(i64(s.st_ctim.tv_sec), i64(s.st_ctim.tv_nsec)),
+         FileTime(i64(s.st_birthtim.tv_sec), i64(s.st_birthtim.tv_nsec)))
+
+// -- The blocking half ------------------------------------------------------------------------
+
+/** Open a file. `flags` is the `O_*` constants ored together, and `mode` is the permission bits a
+ * newly created file gets -- 0o644 written out, since sysl has no octal literal for it.
+ *
+ *     val f = open_sync("notes.txt", O_WRONLY | O_CREAT | O_TRUNC)?
+ */
+open_sync(path: string, flags: i32 = O_RDONLY,
+          mode: i32 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) -> Result[File, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val fd = c.fs_open(default_loop().raw(), r, p.ptr, flags, mode, null)
+
+    c.fs_req_cleanup(r)
+
+    if fd < 0 then Err(Error(fd)) else Ok(File(fd))
+
+/** The whole of a file, read in one go.
+ *
+ * **It reads the size first and then the bytes**, so a file being written while this runs may come
+ * back short. That is the ordinary trade a whole-file read makes and is why a server streams
+ * instead.
+ */
+read_file_sync(path: string) -> Result[[]u8, Error]
+    val f = open_sync(path)?
+    val info = f.stat_sync()
+
+    if info.is_err()
+        f.close_sync()
+        return Err(info.unwrap_err())
+
+    var out: []u8 = [0; usize(info.unwrap().size)]
+    var at: usize = 0
+
+    while at < out.len
+        val n = f.read_sync(out[at..<out.len])
+
+        if n.is_err()
+            f.close_sync()
+            return Err(n.unwrap_err())
+
+        if n.unwrap() == 0 then break
+
+        at += n.unwrap()
+
+    f.close_sync()?
+    Ok(out[0..<at])
+
+/** Write a file from nothing, replacing whatever was there. */
+write_file_sync(path: string, bytes: []const u8,
+                mode: i32 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) -> Result[unit, Error]
+    val f = open_sync(path, O_WRONLY | O_CREAT | O_TRUNC, mode)?
+    val w = f.write_all_sync(bytes)
+
+    f.close_sync()?
+    w
+
+/** What the file system knows about a path, following symbolic links. */
+stat_sync(path: string) -> Result[Stat, Error] = stat_through(path, false)
+
+/** The same, reporting on the link itself rather than what it points at. */
+lstat_sync(path: string) -> Result[Stat, Error] = stat_through(path, true)
+
+private stat_through(path: string, of_the_link: bool) -> Result[Stat, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    var code: i32 = 0
+
+    if of_the_link
+        code = c.fs_lstat(default_loop().raw(), r, p.ptr, null)
+    else
+        code = c.fs_stat(default_loop().raw(), r, p.ptr, null)
+
+    var out = blank_stat()
+
+    if code >= 0 then out = stat_of(c.fs_get_statbuf(r))
+
+    c.fs_req_cleanup(r)
+
+    if code < 0 then Err(Error(code)) else Ok(out)
+
+/** Whether a path exists, and whether the process may do what `mode` asks -- `F_OK` for existence,
+ * and `R_OK`, `W_OK`, `X_OK` for the three permissions.
+ */
+access_sync(path: string, mode: i32 = F_OK) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_access(default_loop().raw(), r, p.ptr, mode, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** Remove a file. `ENOENT` where there was none, which is the failure a caller usually ignores. */
+unlink_sync(path: string) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_unlink(default_loop().raw(), r, p.ptr, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** Make a directory, and only the last component of it. `mode` is 0o777 by default, which the
+ * process's umask then narrows -- the same default `mkdir(1)` has.
+ */
+mkdir_sync(path: string, mode: i32 = 511) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_mkdir(default_loop().raw(), r, p.ptr, mode, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** Remove an empty directory. `ENOTEMPTY` where it is not. */
+rmdir_sync(path: string) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_rmdir(default_loop().raw(), r, p.ptr, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** Rename or move a path. Across file systems this fails with `EXDEV` rather than copying. */
+rename_sync(path: string, to: string) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val a = cstring(path)
+    val b = cstring(to)
+    val code = c.fs_rename(default_loop().raw(), r, a.ptr, b.ptr, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** Copy a file, using whatever the platform has that is faster than reading and writing it. */
+copyfile_sync(path: string, to: string, flags: i32 = 0) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val a = cstring(path)
+    val b = cstring(to)
+    val code = c.fs_copyfile(default_loop().raw(), r, a.ptr, b.ptr, flags, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** Change a file's permission bits. */
+chmod_sync(path: string, mode: i32) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_chmod(default_loop().raw(), r, p.ptr, mode, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** The path with every link followed and every `..` resolved, as the file system sees it. */
+realpath_sync(path: string) -> Result[string, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_realpath(default_loop().raw(), r, p.ptr, null)
+    var out = ""
+
+    if code >= 0 then out = from_cstring(c.fs_get_ptr(r)).unwrap_or("")
+
+    c.fs_req_cleanup(r)
+
+    if code < 0 then Err(Error(code)) else Ok(out)
+
+/** Where a symbolic link points, without following it. */
+readlink_sync(path: string) -> Result[string, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_readlink(default_loop().raw(), r, p.ptr, null)
+    var out = ""
+
+    if code >= 0 then out = from_cstring(c.fs_get_ptr(r)).unwrap_or("")
+
+    c.fs_req_cleanup(r)
+
+    if code < 0 then Err(Error(code)) else Ok(out)
+
+/** A directory made from a template whose last six characters are `XXXXXX`, answering the name it
+ * ended up with. What a program uses instead of inventing a temporary path and racing.
+ */
+mkdtemp_sync(template: string) -> Result[string, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val t = cstring(template)
+    val code = c.fs_mkdtemp(default_loop().raw(), r, t.ptr, null)
+    var out = ""
+
+    if code >= 0 then out = from_cstring(c.fs_get_path(r)).unwrap_or("")
+
+    c.fs_req_cleanup(r)
+
+    if code < 0 then Err(Error(code)) else Ok(out)
+
+/** Everything in a directory, without `.` and `..`. */
+scandir_sync(path: string) -> Result[[]Dirent, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val p = cstring(path)
+    val code = c.fs_scandir(default_loop().raw(), r, p.ptr, 0, null)
+    var found: Buf[Dirent] = buf()
+
+    if code >= 0 then found = entries_of(r)
+
+    c.fs_req_cleanup(r)
+
+    if code < 0 then Err(Error(code)) else Ok(found.view())
+
+// Walk what a scandir left in the request. libuv hands them back one at a time and owns the name
+// each time, so each is copied here rather than viewed.
+private entries_of(r: *c.Fs) -> Buf[Dirent]
+    var found: Buf[Dirent] = buf()
+    var ent = c.Dirent(null, 0)
+
+    while c.fs_scandir_next(r, &ent) == 0
+        found.push(Dirent(from_cstring(ent.name).unwrap_or(""), ent.kind))
+
+    found
+
+// -- The asynchronous half --------------------------------------------------------------------
+//
+// Every one of these runs on libuv's thread pool and answers on the loop, so nothing here blocks
+// the caller and nothing here runs the callback before the loop next turns -- not even for a path
+// that does not exist.
+//
+// **The request holds a reference to itself until libuv answers**, which is the same arrangement a
+// handle uses: nothing has to be kept by the caller, and the storage goes when the callback has
+// run.
+
+// What kind of answer a request is going to produce, and what to do with it. One enum rather than a
+// field per shape, since exactly one of them is ever set.
+private enum FsDone
+    Opened(f: &Fn(Result[File, Error]) -> unit)
+    Bytes(f: &Fn(Result[[]u8, Error]) -> unit)
+    Counted(f: &Fn(Result[usize, Error]) -> unit)
+    Nothing(f: &Fn(Result[unit, Error]) -> unit)
+    Stats(f: &Fn(Result[Stat, Error]) -> unit)
+    Entries(f: &Fn(Result[[]Dirent, Error]) -> unit)
+    Named(f: &Fn(Result[string, Error]) -> unit)
+
+private struct FsReq
+    storage: [c.FS_WORDS]u64
+    bufs: [c.BUF_WORDS]u64
+    data: []u8
+    me: Option[&FsReq]
+    done: FsDone
+
+    req(*self) -> *c.Fs = ptr_cast(&self.storage[0])
+    buf(*self) -> *c.Buf = ptr_cast(&self.bufs[0])
+
+private new_fs_req(done: FsDone) -> &FsReq
+    var q: &FsReq = FsReq([0; c.FS_WORDS], [0; c.BUF_WORDS], [0; 0], None, done)
+
+    q.me = Some(q)
+    c.req_set_data(ptr_cast(q.req()), ptr_cast(&*q))
+    q
+
+// A request libuv refused to start is one whose callback will never run, so its self-reference has
+// to go here instead.
+private started(q: &FsReq, code: i32) -> Result[unit, Error]
+    if code < 0
+        q.me = None
+        return Err(Error(code))
+
+    Ok(())
+
+private fs_done(req: *c.Fs) -> unit
+    val q: *FsReq = ptr_cast(c.req_get_data(ptr_cast(req)))
+    val done = q.done
+    var bytes = q.data
+    val n = c.fs_get_result(req)
+    val code = i32(n)
+
+    // Everything the answer needs out of the request, taken before it is cleaned up: after that
+    // call the stat buffer, the entry list and the path are libuv's to reuse.
+    var stats = blank_stat()
+    var entries: Buf[Dirent] = buf()
+    var name = ""
+
+    if code >= 0
+        done match
+            Stats(_) -> stats = stat_of(c.fs_get_statbuf(req))
+            Entries(_) -> entries = entries_of(req)
+            Named(_) -> name = from_cstring(c.fs_get_ptr(req)).unwrap_or("")
+            _ -> ()
+
+    c.fs_req_cleanup(req)
+
+    q.done = Nothing(ignore_status)
+    q.data = [0; 0]
+    q.me = None
+
+    done match
+        Opened(f) -> f(if code < 0 then Err(Error(code)) else Ok(File(code)))
+        Bytes(f) -> f(if code < 0 then Err(Error(code)) else Ok(bytes[0..<usize(n)]))
+        Counted(f) -> f(counted(n))
+        Nothing(f) -> f(checked(code))
+        Stats(f) -> f(if code < 0 then Err(Error(code)) else Ok(stats))
+        Entries(f) -> f(if code < 0 then Err(Error(code)) else Ok(entries.view()))
+        Named(f) -> f(if code < 0 then Err(Error(code)) else Ok(name))
+
+/** Open a file on the thread pool. The flags and the mode are `open_sync`'s. */
+open(path: string, cb: &Fn(Result[File, Error]) -> unit, flags: i32 = O_RDONLY,
+     mode: i32 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH,
+     lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Opened(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_open(lp.raw(), q.req(), p.ptr, flags, mode, &fs_done))
+
+/** Close a file on the thread pool. */
+close(file: File, cb: &Fn(Result[unit, Error]) -> unit = ignore_status,
+      lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Nothing(cb))
+
+    started(q, c.fs_close(lp.raw(), q.req(), file.descriptor(), &fs_done))
+
+/** Read up to `length` bytes, and hand the callback the ones that arrived.
+ *
+ * **The buffer belongs to the request**, which allocates it and hands it over -- so the callback
+ * may keep what it is given, and a caller need not find storage that outlives the call.
+ *
+ * `offset` of `-1` reads from wherever the file is positioned.
+ */
+read(file: File, length: usize, cb: &Fn(Result[[]u8, Error]) -> unit, offset: i64 = -1,
+     lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Bytes(cb))
+
+    q.data = [0; length]
+    c.buf_set(q.buf(), as_mut_ptr(q.data), length)
+
+    started(q, c.fs_read(lp.raw(), q.req(), file.descriptor(), q.buf(), 1, offset, &fs_done))
+
+/** Write `bytes`, and hand the callback how many were taken. **The bytes are copied**, since the
+ * write outlives the call.
+ */
+write(file: File, bytes: []const u8, cb: &Fn(Result[usize, Error]) -> unit = ignore_count,
+      offset: i64 = -1, lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Counted(cb))
+
+    q.data = copy_of_bytes(bytes)
+    c.buf_set(q.buf(), as_mut_ptr(q.data), q.data.len)
+
+    started(q, c.fs_write(lp.raw(), q.req(), file.descriptor(), q.buf(), 1, offset, &fs_done))
+
+/** What the file system knows about a path, following symbolic links. */
+stat(path: string, cb: &Fn(Result[Stat, Error]) -> unit,
+     lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Stats(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_stat(lp.raw(), q.req(), p.ptr, &fs_done))
+
+/** The same, reporting on the link itself. */
+lstat(path: string, cb: &Fn(Result[Stat, Error]) -> unit,
+      lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Stats(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_lstat(lp.raw(), q.req(), p.ptr, &fs_done))
+
+/** Remove a file. */
+unlink(path: string, cb: &Fn(Result[unit, Error]) -> unit = ignore_status,
+       lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Nothing(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_unlink(lp.raw(), q.req(), p.ptr, &fs_done))
+
+/** Make a directory, and only the last component of it. */
+mkdir(path: string, cb: &Fn(Result[unit, Error]) -> unit = ignore_status, mode: i32 = 511,
+      lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Nothing(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_mkdir(lp.raw(), q.req(), p.ptr, mode, &fs_done))
+
+/** Remove an empty directory. */
+rmdir(path: string, cb: &Fn(Result[unit, Error]) -> unit = ignore_status,
+      lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Nothing(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_rmdir(lp.raw(), q.req(), p.ptr, &fs_done))
+
+/** Rename or move a path. */
+rename(path: string, to: string, cb: &Fn(Result[unit, Error]) -> unit = ignore_status,
+       lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Nothing(cb))
+    val a = cstring(path)
+    val b = cstring(to)
+
+    started(q, c.fs_rename(lp.raw(), q.req(), a.ptr, b.ptr, &fs_done))
+
+/** The path with every link followed and every `..` resolved. */
+realpath(path: string, cb: &Fn(Result[string, Error]) -> unit,
+         lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Named(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_realpath(lp.raw(), q.req(), p.ptr, &fs_done))
+
+/** Everything in a directory, without `.` and `..`. */
+scandir(path: string, cb: &Fn(Result[[]Dirent, Error]) -> unit,
+        lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Entries(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_scandir(lp.raw(), q.req(), p.ptr, 0, &fs_done))
+
+/** The whole of a file, without blocking: open, measure, read, close, and hand over the bytes.
+ *
+ * Four trips through the thread pool rather than one, which is the price of not blocking. A server
+ * serving files streams instead; this is for the ones small enough to hold.
+ */
+read_file(path: string, cb: &Fn(Result[[]u8, Error]) -> unit,
+          lp: &Loop = default_loop()) -> Result[unit, Error]
+    open(path, (opened) ->
+        opened match
+            Err(e) -> cb(Err(e))
+            Ok(f) -> stat_then_read(f, cb, lp), O_RDONLY, 0, lp)
+
+private stat_then_read(f: File, cb: &Fn(Result[[]u8, Error]) -> unit, lp: &Loop)
+    val fd = f
+
+    fstat_of(fd, (info) ->
+        info match
+            Err(e) ->
+                close(fd, ignore_status, lp)
+                cb(Err(e))
+            Ok(s) ->
+                read(fd, usize(s.size), (got) ->
+                    close(fd, ignore_status, lp)
+                    cb(got), -1, lp), lp)
+
+// `fstat` of an open file, which is the one asynchronous call `File` does not carry as a method --
+// a method taking a callback would read as though the file were doing the waiting.
+private fstat_of(file: File, cb: &Fn(Result[Stat, Error]) -> unit, lp: &Loop) -> Result[unit, Error]
+    val q = new_fs_req(Stats(cb))
+
+    started(q, c.fs_fstat(lp.raw(), q.req(), file.descriptor(), &fs_done))
+
+private ignore_count(r: Result[usize, Error]) -> unit = ()
+
+// Bytes of our own, since a write outlives the call that started it.
+private copy_of_bytes(bytes: []const u8) -> []u8
+    var out: []u8 = [0; bytes.len]
+
+    for i in 0..<bytes.len do out[i] = bytes[i]
+
+    out

@@ -1,0 +1,99 @@
+// A terminal, as a stream.
+//
+//     val out = tty(1)?
+//     val (cols, rows) = out.winsize()?
+//
+//     val input = tty(0)?
+//
+//     input.set_mode(TTY_MODE_RAW)?
+//     input.read_start((r) -> r match
+//         Data(keys) -> handle(keys)
+//         End -> input.close()
+//         Failed(_) -> input.close())
+//
+// **Raw mode is the process's, not the handle's**, which is why `reset_mode` is a free function
+// with no handle in it: it puts the terminal back however many handles were opened on it. A program
+// that leaves raw mode set leaves the user's shell in it, so **call it before exiting**, including
+// on the path where something went wrong.
+//
+// `guess_handle(0)` is how to find out whether standard input is a terminal at all before opening
+// one on it.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+/** One of the process's terminal descriptors, opened as a stream. */
+struct Tty
+    private storage: [c.TTY_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Tty]
+    private st: StreamState
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Tty = ptr_cast(&self.storage[0])
+
+    /** The loop this terminal is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** `TTY_MODE_NORMAL` for line editing and echo, `TTY_MODE_RAW` for a key at a time, and
+     * `TTY_MODE_IO` for raw with no processing at all -- which is what a full-screen program wants.
+     */
+    set_mode(*self, mode: i32) -> Result[unit, Error] = checked(c.tty_set_mode(self.raw(), mode))
+
+    /** The terminal's size in characters, columns first.
+     *
+     * This is read at the moment it is called and is not watched: a program that redraws on resize
+     * catches `SIGWINCH` with a `Signal` and asks again.
+     */
+    winsize(*self) -> Result[(int, int), Error]
+        var w: i32 = 0
+        var h: i32 = 0
+        val r = c.tty_get_winsize(self.raw(), &w, &h)
+
+        if r < 0 then Err(Error(r)) else Ok((int(w), int(h)))
+end Tty
+
+impl Handle for Tty
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.st.on_read = ignore_read
+        self.st.on_connection = noop
+        self.st.buffer = [0; 0]
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+impl Stream for Tty
+    stream_ptr(*self) -> *c.Stream = ptr_cast(&self.storage[0])
+
+    stream_state(*self) -> *StreamState = &self.st
+
+/** A terminal handle over a descriptor -- `0`, `1` or `2` for the three the process was started
+ * with.
+ *
+ * `EINVAL` for a descriptor that is not a terminal, which is what happens when the program's output
+ * is a pipe. `guess_handle` is the way to ask first.
+ */
+tty(fd: i32, lp: &Loop = default_loop()) -> Result[&Tty, Error]
+    var t: &Tty = Tty([0; c.TTY_WORDS], lp, None, fresh_stream_state(), noop)
+
+    checked(c.tty_init(lp.raw(), t.raw(), fd, 0))?
+
+    t.me = Some(t)
+    c.handle_set_data(t.handle_ptr(), ptr_cast(&*t))
+    Ok(t)
+
+/** Put the terminal back the way it was found.
+ *
+ * **It is the process's terminal rather than any one handle's**, so this takes nothing and must be
+ * called before the program exits if it ever left normal mode -- including from a signal handler,
+ * and including on the way out of a failure.
+ */
+reset_tty_mode() -> Result[unit, Error] = checked(c.tty_reset_mode())

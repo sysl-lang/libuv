@@ -1,0 +1,153 @@
+// Named pipes and Unix domain sockets, which libuv calls one thing because they are one thing to it.
+//
+//     val server = pipe()?
+//
+//     server.bind("/tmp/my.sock")?
+//     server.listen(128, () -> ...)
+//
+// **A pipe is a stream**, so reading, writing, shutting down and back-pressure are all in `Stream`
+// and written the same way they are for TCP.
+//
+// **libuv removes the socket file when the handle is closed**, which is checked in this package's
+// own suite rather than taken from the documentation. What it does not clean up is a socket left
+// behind by a process that was killed, so a server that is restarted still wants an `unlink_sync`
+// of its path before it binds -- ignoring the `ENOENT` for the ordinary case where there is none.
+//
+// The other use is talking to a child process, which is what `ipc` is for: a pipe created with it
+// can carry a handle as well as bytes, which is how a parent hands a listening socket to a worker.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.text.cstring
+import sysl.text.from_cstring
+
+/** One end of a pipe: a listener, a connection, or neither yet. */
+struct Pipe
+    private storage: [c.PIPE_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Pipe]
+    private st: StreamState
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Pipe = ptr_cast(&self.storage[0])
+
+    /** The loop this pipe is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Take a name: a path for a Unix domain socket, or an abstract name on Linux where the first
+     * byte is a NUL. `EADDRINUSE` where the path already exists, which is the usual failure after a
+     * process was killed.
+     */
+    bind(*self, name: string) -> Result[unit, Error]
+        val n = cstring(name)
+
+        checked(c.pipe_bind2(self.raw(), n.ptr, n.len, 0))
+
+    /** Connect to a name, and call `cb` when the attempt finished. As with TCP, `Ok` here means the
+     * attempt started and the callback carries whether it worked.
+     */
+    connect(*self, name: string,
+            cb: &Fn(Result[unit, Error]) -> unit = ignore_status) -> Result[unit, Error]
+        val n = cstring(name)
+        var k: &ConnectReq = ConnectReq([0; c.CONNECT_WORDS], None, cb)
+
+        k.me = Some(k)
+        c.req_set_data(ptr_cast(k.req()), ptr_cast(&*k))
+
+        val r = c.pipe_connect2(k.req(), self.raw(), n.ptr, n.len, 0, &connect_done)
+
+        if r < 0
+            k.me = None
+            return Err(Error(r))
+
+        Ok(())
+
+    /** Take the next connection, from inside the callback `listen` was given. */
+    accept(*self) -> Result[&Pipe, Error]
+        val client = pipe(false, self.lp)?
+        val r = c.accept(self.stream_ptr(), client.stream_ptr())
+
+        if r < 0
+            client.close()
+            return Err(Error(r))
+
+        Ok(client)
+
+    /** Adopt an existing descriptor -- one end of a `pipe(2)`, an inherited socket, a descriptor a
+     * child was given. **libuv owns it afterwards.**
+     */
+    open(*self, fd: i32) -> Result[unit, Error] = checked(c.pipe_open(self.raw(), fd))
+
+    /** This end's name. */
+    sockname(*self) -> Result[string, Error] = self.name_through(true)
+
+    /** The other end's name, which a Unix domain socket usually does not have. */
+    peername(*self) -> Result[string, Error] = self.name_through(false)
+
+    /** Let others read from or write to the socket file. `READABLE_PIPE`, `WRITABLE_PIPE`, or both
+     * together.
+     */
+    chmod(*self, flags: i32) -> Result[unit, Error] = checked(c.pipe_chmod(self.raw(), flags))
+
+    private name_through(*self, local: bool) -> Result[string, Error]
+        var buf: [1024]u8 = [0; 1024]
+        var size: usize = 1024
+        var r: i32 = 0
+
+        if local
+            r = c.pipe_getsockname(self.raw(), &buf[0], &size)
+        else
+            r = c.pipe_getpeername(self.raw(), &buf[0], &size)
+
+        if r < 0 then return Err(Error(r))
+
+        Ok(from_cstring(&buf[0]).unwrap_or(""))
+end Pipe
+
+impl Handle for Pipe
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.st.on_read = ignore_read
+        self.st.on_connection = noop
+        self.st.buffer = [0; 0]
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+impl Stream for Pipe
+    stream_ptr(*self) -> *c.Stream = ptr_cast(&self.storage[0])
+
+    stream_state(*self) -> *StreamState = &self.st
+
+/** A pipe on `lp`, connected to nothing.
+ *
+ * `ipc` says this pipe will be used to pass handles between processes as well as bytes, which is
+ * what a parent handing a listening socket to a worker needs. It costs nothing to leave off.
+ */
+pipe(ipc: bool = false, lp: &Loop = default_loop()) -> Result[&Pipe, Error]
+    var p: &Pipe = Pipe([0; c.PIPE_WORDS], lp, None, fresh_stream_state(), noop)
+
+    checked(c.pipe_init(lp.raw(), p.raw(), if ipc then 1 else 0))?
+
+    p.me = Some(p)
+    c.handle_set_data(p.handle_ptr(), ptr_cast(&*p))
+    Ok(p)
+
+/** A pair of connected descriptors, the way `pipe(2)` makes one: the first reads what is written to
+ * the second.
+ *
+ * Neither is a handle yet -- `open` on a `Pipe` is what makes one into one. This is what a parent
+ * uses to wire up a child's output, since the child needs a plain descriptor.
+ */
+pipe_pair(read_flags: i32 = 0, write_flags: i32 = 0) -> Result[(i32, i32), Error]
+    var fds: [2]i32 = [0, 0]
+    val r = c.pipe_pair(&fds[0], read_flags, write_flags)
+
+    if r < 0 then Err(Error(r)) else Ok((fds[0], fds[1]))

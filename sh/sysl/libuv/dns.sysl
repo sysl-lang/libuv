@@ -1,0 +1,106 @@
+// Turning a name into addresses, without blocking the loop.
+//
+//     resolve("example.com", "https", (r) -> r match
+//         Ok(found) -> for a in found do print(a.address)
+//         Err(e) -> print(s"cannot resolve: $e"))?
+//
+// **`getaddrinfo` blocks**, on every platform, which is why libuv runs it on its thread pool and
+// answers through the loop. That is the whole reason this is a callback and `ip4` is not.
+//
+// **The answer is a list and the order matters**: the resolver has already sorted it by what it
+// thinks is most likely to work, so a client tries them in the order it was given rather than
+// picking one.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.buf.{Buf, buf}
+import sysl.text.cstring
+import sysl.text.from_cstring
+
+/** One way to reach a name: an address, and what kind of socket it is for.
+ *
+ * `canonical` is empty unless `AI_CANONNAME` was asked for, and is the name the resolver considers
+ * the real one -- which is how a program follows a `CNAME` back to what it points at.
+ */
+struct AddrInfo
+    address: Address
+    family: i32
+    socktype: i32
+    protocol: i32
+    canonical: string
+
+/** An `AddrInfo` renders as the address it carries, since that is what it is for. */
+impl Display for AddrInfo
+    display(self, out: *Writer, fmt: FormatSpec) = self.address.display(out, fmt)
+
+// The request, its hints, and the callback, all alive until libuv answers.
+private struct Lookup
+    storage: [c.GETADDRINFO_WORDS]u64
+    hints: [c.ADDRINFO_WORDS]u64
+    me: Option[&Lookup]
+    on_done: &Fn(Result[[]AddrInfo, Error]) -> unit
+
+    req(*self) -> *c.GetAddrInfo = ptr_cast(&self.storage[0])
+    hint(*self) -> *c.AddrInfo = ptr_cast(&self.hints[0])
+
+private ignore_found(r: Result[[]AddrInfo, Error]) -> unit = ()
+
+private resolve_done(req: *c.GetAddrInfo, status: i32, res: *c.AddrInfo) -> unit
+    val q: *Lookup = ptr_cast(c.req_get_data(ptr_cast(req)))
+    val cb = q.on_done
+
+    q.on_done = ignore_found
+    q.me = None
+
+    if status < 0
+        cb(Err(Error(status)))
+        return
+
+    var found: Buf[AddrInfo] = buf()
+    var p = res
+
+    while p != null
+        val name = c.ai_canonname(p)
+        val canonical = if name == null then "" else from_cstring(name).unwrap_or("")
+
+        found.push(AddrInfo(address_at(c.ai_addr(p)), c.ai_family(p), c.ai_socktype(p),
+                            c.ai_protocol(p), canonical))
+        p = c.ai_next(p)
+
+    // libuv's storage, released here -- everything above was copied into storage of ours, which is
+    // why the callback may keep what it is given.
+    c.freeaddrinfo(res)
+    cb(Ok(found.view()))
+
+/** Resolve `host` and `service`, and call `cb` with every way the resolver found to reach it.
+ *
+ * `service` is a port as text -- `"80"` -- or a name out of the services file -- `"http"`. Empty
+ * for a lookup that only wants addresses; the ports in the answer are then `0`.
+ *
+ * `family` narrows the answer to `AF_INET` or `AF_INET6`, and `AF_UNSPEC` -- the default -- asks for
+ * both. `socktype` of `SOCK_STREAM` is what stops the resolver answering three times per address,
+ * once per protocol. `flags` takes `AI_CANONNAME`, `AI_PASSIVE`, `AI_NUMERICHOST` and the rest.
+ *
+ * `Ok` from this call means the lookup was started; whether it found anything is what the callback
+ * carries. `EAI_NONAME` is the failure for a name that does not resolve.
+ */
+resolve(host: string, service: string, cb: &Fn(Result[[]AddrInfo, Error]) -> unit,
+        family: i32 = AF_UNSPEC, socktype: i32 = SOCK_STREAM, flags: i32 = 0,
+        lp: &Loop = default_loop()) -> Result[unit, Error]
+    var q: &Lookup = Lookup([0; c.GETADDRINFO_WORDS], [0; c.ADDRINFO_WORDS], None, cb)
+
+    q.me = Some(q)
+    c.req_set_data(ptr_cast(q.req()), ptr_cast(&*q))
+    c.hints_init(q.hint(), family, socktype, 0, flags)
+
+    val h = cstring(host)
+    val s = cstring(service)
+    val service_ptr = if service == "" then null else s.ptr
+    val r = c.getaddrinfo(lp.raw(), q.req(), &resolve_done, h.ptr, service_ptr, q.hint())
+
+    if r < 0
+        q.me = None
+        return Err(Error(r))
+
+    Ok(())
