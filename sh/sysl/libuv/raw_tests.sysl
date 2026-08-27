@@ -1,0 +1,190 @@
+module sh.sysl.libuv
+@tests
+
+// The declarations in `sh.sysl.libuv.c` that the pleasant layer above does not reach.
+//
+// **This file exists because a declaration nothing calls is a declaration nothing checks.** The
+// lower layer has to be *faithful* -- a signature that disagrees with `uv.h` links perfectly and
+// corrupts the call at run time -- and the only thing standing between a wrong one and a program is
+// somebody having exercised it. Everything the layer above uses is covered by the tests beside this
+// one; what is left is covered here, by calling it directly.
+//
+// **`uv_cancel` is the one that is not declared at all**, and the reason is in `c.sysl`: it may only
+// be called on a request still in flight, and on a finished one it segfaults rather than answering.
+
+import sh.sysl.libuv.c
+import sysl.text.cstring
+import sysl.text.from_cstring
+
+// -- The shim's buffer accessors ------------------------------------------------------------------
+
+// `uv_buf_t` is `{base, len}` on Unix and the two the other way round on Windows, which is why the
+// three of these exist rather than a sysl struct. The layer above writes one and never reads it
+// back; this is what says the reading half is right.
+@test("a buf carries the pointer and the length that were put in it")
+buffers()
+    var storage: [c.BUF_WORDS]u64 = [0; c.BUF_WORDS]
+    var bytes: [8]u8 = [0; 8]
+    val b: *c.Buf = ptr_cast(&storage[0])
+
+    c.buf_set(b, &bytes[0], 8)
+
+    assert_eq(usize(c.buf_base(b)), usize(&bytes[0]))
+    assert_eq(c.buf_len(b), 8)
+
+    // And a second write replaces both halves rather than one of them.
+    c.buf_set(b, &bytes[4], 4)
+
+    assert_eq(usize(c.buf_base(b)), usize(&bytes[4]))
+    assert_eq(c.buf_len(b), 4)
+
+// -- Naming things --------------------------------------------------------------------------------
+
+@test("libuv names a handle type and a request type")
+type_names()
+    assert_eq(from_cstring(c.handle_type_name(HANDLE_TIMER)).unwrap_or("?"), "timer")
+    assert_eq(from_cstring(c.handle_type_name(HANDLE_TCP)).unwrap_or("?"), "tcp")
+    assert_eq(from_cstring(c.handle_type_name(HANDLE_SIGNAL)).unwrap_or("?"), "signal")
+
+    assert_eq(from_cstring(c.req_type_name(REQ_WRITE)).unwrap_or("?"), "write")
+    assert_eq(from_cstring(c.req_type_name(REQ_FS)).unwrap_or("?"), "fs")
+
+@test("a live handle reports its own type and the loop it is on")
+handle_identity()
+    val lp = new_loop().expect("a loop")
+    val t = timer(lp).expect("a timer")
+    val sock = tcp(lp).expect("a socket")
+
+    assert_eq(c.handle_get_type(t.handle_ptr()), HANDLE_TIMER)
+    assert_eq(c.handle_get_type(sock.handle_ptr()), HANDLE_TCP)
+    assert_eq(usize(c.handle_get_loop(t.handle_ptr())), usize(lp.raw()))
+
+    t.close()
+    sock.close()
+    lp.run().expect("the loop ran")
+    lp.close().expect("closed")
+
+// -- Errors the platform reported --------------------------------------------------------------
+
+// libuv's codes are its own, not the platform's, and this is the conversion a program needs when it
+// has an `errno` from somewhere outside libuv and wants to compare it with one of these.
+@test("a platform errno translates to the libuv code for the same failure")
+translating()
+    assert_eq(c.translate_sys_error(2), ENOENT)
+    assert_eq(c.translate_sys_error(13), EACCES)
+    assert_eq(c.translate_sys_error(0), 0)
+
+// -- Addresses, the way the platform writes them ------------------------------------------------
+
+// `Address` covers what a program needs, and these two are the raw conversions under it: text to
+// four bytes and back. What they check that `Address` does not is the *byte order* of the result,
+// since a dotted quad read backwards still renders as a plausible address.
+@test("an address converts to bytes and back, in the order the wire uses")
+address_bytes()
+    var raw: [4]u8 = [0; 4]
+    val src = cstring("1.2.3.4")
+
+    assert_eq(c.inet_pton(AF_INET, src.ptr, &raw[0]), 0)
+    assert_eq(raw[0], 1)
+    assert_eq(raw[1], 2)
+    assert_eq(raw[2], 3)
+    assert_eq(raw[3], 4)
+
+    var out: [64]u8 = [0; 64]
+
+    assert_eq(c.inet_ntop(AF_INET, &raw[0], &out[0], 64), 0)
+    assert_eq(from_cstring(&out[0]).unwrap_or("?"), "1.2.3.4")
+
+    // And text that is not an address is refused rather than half-read.
+    val bad = cstring("not.an.address")
+
+    assert(c.inet_pton(AF_INET, bad.ptr, &raw[0]) < 0, "nonsense is not an address")
+
+@test("the first network interface has a name")
+interface_names()
+    var name: [64]u8 = [0; 64]
+    var size: usize = 64
+
+    // Index 1 is the loopback on every platform this builds for. What it is *called* is the
+    // platform's business -- `lo0` here, `lo` on Linux -- so what is checked is that it has one.
+    assert_eq(c.if_indextoname(1, &name[0], &size), 0)
+    assert(from_cstring(&name[0]).unwrap_or("").len > 0, "and it is not empty")
+    assert(size > 0, "and the length came back")
+
+// -- The processor mask -------------------------------------------------------------------------
+
+// A size where the platform has thread affinity, and a libuv error where it does not -- macOS is
+// the second, answering `ENOTSUP`. Both are ordinary answers, so what would be wrong is `0`, which
+// is neither.
+@test("the cpu mask size is either a size or a refusal")
+cpu_mask()
+    val n = c.cpumask_size()
+
+    assert(n != 0, "a size or an error, and zero is neither")
+    assert(n > 0 || n == ENOTSUP, "and the refusal is the one macOS gives")
+
+// -- Inside a file system request ------------------------------------------------------------
+
+// The layer above reads a request's result and its stat buffer; these three are the rest of what a
+// `uv_fs_t` carries. `fs_get_system_error` is the interesting one -- it is the *platform's* errno
+// for the same failure, which is what a program correlates with something outside libuv.
+@test("a finished request says what it was and how the platform saw it")
+request_contents()
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val here = cstring("/tmp")
+
+    assert_eq(c.fs_stat(c.default_loop(), r, here.ptr, null), 0)
+    assert_eq(c.req_get_type(ptr_cast(r)), REQ_FS)
+    assert(c.fs_get_type(r) > 0, "it knows which file system call it was")
+    assert_eq(c.fs_get_system_error(r), 0)
+    assert_eq(from_cstring(c.fs_get_path(r)).unwrap_or("?"), "/tmp")
+
+    c.fs_req_cleanup(r)
+
+    // And a failure carries the platform's own number beside libuv's.
+    var bad: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val b: *c.Fs = ptr_cast(&bad[0])
+    val missing = cstring("/no/such/path/anywhere")
+
+    assert_eq(c.fs_stat(c.default_loop(), b, missing.ptr, null), ENOENT)
+    assert(c.fs_get_system_error(b) != 0, "the platform said so too")
+    assert_eq(c.translate_sys_error(c.fs_get_system_error(b)), ENOENT)
+
+    c.fs_req_cleanup(b)
+
+// -- Sending a file ------------------------------------------------------------------------------
+
+// The kernel's own copy, which is what a file server reaches for instead of reading and writing.
+// Nothing above wraps it yet, so this is the only thing checking the declaration.
+@test("sendfile copies bytes from one descriptor to another without them passing through here")
+sending_a_file()
+    val dir = mkdtemp_sync("/tmp/libuv-raw-XXXXXX").expect("a temporary directory")
+    val from = dir + "/from"
+    val to = dir + "/to"
+
+    write_file_sync(from, [1, 2, 3, 4, 5, 6, 7, 8]).expect("written")
+
+    val src = open_sync(from).expect("opened")
+    val dst = open_sync(to, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR).expect("opened")
+
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val n = c.fs_sendfile(c.default_loop(), r, dst.descriptor(), src.descriptor(), 0, 8, null)
+
+    c.fs_req_cleanup(r)
+
+    assert_eq(n, 8)
+
+    src.close_sync().expect("closed")
+    dst.close_sync().expect("closed")
+
+    val back = read_file_sync(to).expect("read")
+
+    assert_eq(back.len, 8)
+    assert_eq(back[0], 1)
+    assert_eq(back[7], 8)
+
+    unlink_sync(from).expect("removed")
+    unlink_sync(to).expect("removed")
+    rmdir_sync(dir).expect("removed")

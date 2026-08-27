@@ -208,6 +208,35 @@ child_environment()
 
     rmdir_sync(dir).expect("removed")
 
+// **`InheritFd` is the slot that takes a descriptor of THIS process's**, where `Inherit` takes the
+// one with the same number. Handing the child a file as its standard output is the shortest thing
+// that tells the two apart: with `Inherit` in that slot the output would land on the test runner's
+// own stdout and the file would stay empty.
+@test("a child writes to the descriptor it was handed, not to the one with the same number")
+child_inherits_a_named_descriptor()
+    val lp = default_loop()
+    val dir = mkdtemp_sync("/tmp/libuv-sys-XXXXXX").expect("a temporary directory")
+    val path = dir + "/captured"
+    val f = open_sync(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR).expect("opened")
+
+    val child = spawn("echo", ["written"], no_exit_action,
+                      [Ignore, InheritFd(f.descriptor()), Inherit], "", [], 0,
+                      lp).expect("the child started")
+
+    child.on_exit((status, signal) -> child.close())
+    lp.run().expect("the loop ran")
+
+    f.close_sync().expect("closed")
+
+    val back = read_file_sync(path).expect("read")
+
+    assert_eq(back.len, 8)
+    assert_eq(back[0], u8('w'))
+    assert_eq(back[7], u8('\n'))
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
 private no_exit_action(status: i64, signal: i32) -> unit = ()
 
 private struct Outcome
