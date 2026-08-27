@@ -1,0 +1,60 @@
+// libuv — the event loop Node.js is built on, bound for sysl.
+//
+// This is the block a consumer writes to reach this package:
+//
+//     dependencies {
+//       libuv { git = "github.com/sysl-lang/libuv", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
+// tag `v0.1.0` on this repository.
+//
+// **libuv has to be installed, and so do its headers.** Nothing is vendored here beyond a small
+// shim: libuv is a large C project with a platform backend per operating system, and a package
+// carrying it would be carrying a port rather than a binding.
+//
+//     brew install libuv             # macOS
+//     sudo apt install libuv1-dev    # Debian / Ubuntu
+//     sudo pacman -S libuv           # Arch
+//
+// **The build needs no flags**, because libuv installs a `libuv.pc` beside itself and the
+// `pkg_config` requirement below asks the machine where it is. `--include-path libuv=<dir>` and
+// `--link-path <dir>` still answer it by hand, for a hermetic build or a prefix pkg-config has
+// never heard of.
+
+package {
+  name    = "libuv"
+  version = "0.1.0"
+
+  // **The oldest compiler this builds with.** A closure written as an argument opens its own
+  // indented block here — `t.start(0, 1000, (t) -> …)` is the shape every callback in this package
+  // is registered with — and that arrived in 0.0.76. An older compiler refuses those files with
+  // `newline expected` pointing at the first line of the body, which reads as a defect in the
+  // example rather than as a compiler too old to have the feature.
+  sysl = "0.0.76"
+}
+
+// **`posix`, because an event loop is the operating system's.** epoll, kqueue, a thread pool, a
+// socket, a signal disposition: there is no freestanding target this works on, and saying so turns
+// "this cannot work here" into one refusal rather than a link error naming `uv_run`.
+//
+// **`heap`, because every handle is a `&T`.** A handle carries libuv's own storage inline and the
+// callbacks beside it, and that box is what keeps the loop's memory alive for exactly as long as
+// libuv is using it. Nothing in this package asks a caller for storage and nothing here is freed by
+// hand.
+//
+// `posix` implies `os`, so that one is not written out.
+requires {
+  heap  = true
+  posix = true
+
+  // libuv answers for itself: a `libuv.pc` is installed beside the library on every platform that
+  // ships it, so the headers `sh.sysl.libuv.c` reads and the `-luv` the link line needs are both
+  // found by asking rather than by a reader typing out their machine's layout.
+  //
+  // **The name is the one pkg-config files it under**, which is `libuv` — the module is `libuv` and
+  // the link directive says `uv`, and none of the three is recoverable from either of the others.
+  pkg_config {
+    libuv = "libuv — `brew install libuv` on macOS, Debian's libuv1-dev, Arch's libuv"
+  }
+}

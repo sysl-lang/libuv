@@ -1,0 +1,198 @@
+module sh.sysl.libuv
+@tests
+
+// What this binding claims, run by `sysl test .`.
+//
+// **The thing under test is the binding, not libuv.** libuv has its own suite and repeating it here
+// would test the library rather than the declarations over it. What is untested anywhere else is
+// the arrangement this package is built on, and every case below is chosen to fail if one of these
+// is not true:
+//
+// - a handle's storage stays where it was put, so libuv's queues still point at it;
+// - a handle stays alive with nothing naming it, and is freed when it is closed;
+// - the address libuv hands a callback finds its way back to the right sysl handle;
+// - a struct this side declares has the layout the header does.
+//
+// **The layout checks are the ones that would otherwise be found at run time and be blamed on
+// something else.** A `Stat` a field short still compiles and links, and reports a file's size as
+// its block count.
+
+import sh.sysl.libuv.c
+
+// -- Layout ---------------------------------------------------------------------------------------
+
+@test("the structs declared on this side are the size C makes them")
+struct_layout()
+    assert_eq(sizeof(c.Stat), c.C_STAT_SIZE)
+    assert_eq(sizeof(c.Dirent), c.C_DIRENT_SIZE)
+    assert_eq(sizeof(c.ProcessOptions), c.C_PROCESS_OPTIONS_SIZE)
+    assert_eq(sizeof(c.Timespec), c.C_TIMESPEC_SIZE)
+    assert_eq(sizeof(c.Timeval64), c.C_TIMEVAL64_SIZE)
+    assert_eq(sizeof(c.Timespec64), c.C_TIMESPEC64_SIZE)
+
+// The sizes this package carries a handle in are `sizeof` measured by the C compiler out of the
+// headers; these are the same sizes asked of the library that is actually linked. They disagree
+// exactly when the headers and the library are two different versions of libuv, which is a
+// mismatch that otherwise shows up as memory corruption somewhere else entirely.
+@test("the storage a handle is carried in is the size the linked library says it needs")
+handle_sizes()
+    assert_eq(c.TIMER_WORDS * 8, round_up(c.handle_size(HANDLE_TIMER)))
+    assert_eq(c.IDLE_WORDS * 8, round_up(c.handle_size(HANDLE_IDLE)))
+    assert_eq(c.PREPARE_WORDS * 8, round_up(c.handle_size(HANDLE_PREPARE)))
+    assert_eq(c.CHECK_WORDS * 8, round_up(c.handle_size(HANDLE_CHECK)))
+    assert_eq(c.ASYNC_WORDS * 8, round_up(c.handle_size(HANDLE_ASYNC)))
+    assert_eq(c.SIGNAL_WORDS * 8, round_up(c.handle_size(HANDLE_SIGNAL)))
+    assert_eq(c.TCP_WORDS * 8, round_up(c.handle_size(HANDLE_TCP)))
+    assert_eq(c.PIPE_WORDS * 8, round_up(c.handle_size(HANDLE_NAMED_PIPE)))
+    assert_eq(c.TTY_WORDS * 8, round_up(c.handle_size(HANDLE_TTY)))
+    assert_eq(c.PROCESS_WORDS * 8, round_up(c.handle_size(HANDLE_PROCESS)))
+
+    assert_eq(c.LOOP_WORDS * 8, round_up(c.loop_size()))
+
+@test("and so is the storage a request is carried in")
+req_sizes()
+    assert_eq(c.WRITE_WORDS * 8, round_up(c.req_size(REQ_WRITE)))
+    assert_eq(c.CONNECT_WORDS * 8, round_up(c.req_size(REQ_CONNECT)))
+    assert_eq(c.SHUTDOWN_WORDS * 8, round_up(c.req_size(REQ_SHUTDOWN)))
+    assert_eq(c.FS_WORDS * 8, round_up(c.req_size(REQ_FS)))
+    assert_eq(c.GETADDRINFO_WORDS * 8, round_up(c.req_size(REQ_GETADDRINFO)))
+
+// Bytes to whole words, which is what the `(sizeof(T) + 7) / 8` in the layer below computes.
+private round_up(n: usize) -> usize = (n + 7) / 8 * 8
+
+// -- Errors ---------------------------------------------------------------------------------------
+
+@test("an error carries libuv's own name and sentence for the code")
+error_names()
+    val e = Error(EOF)
+
+    assert_eq(e.name(), "EOF")
+    assert_eq(e.message(), "end of file")
+    assert_eq(s"$e", "EOF: end of file")
+
+@test("errors compare by code")
+error_equality()
+    assert_eq(Error(EOF), Error(EOF))
+    assert(Error(EOF) != Error(EPIPE), "two codes are two errors")
+
+@test("check turns libuv's convention into a Result")
+check_is_the_convention()
+    assert(check(0).is_ok(), "zero is success")
+    assert(check(1).is_ok(), "and so is anything above it")
+    assert_eq(check(EOF).unwrap_err(), Error(EOF))
+    assert_eq(check_count(-4095).unwrap_err().code, EOF)
+    assert_eq(check_count(17).unwrap(), 17)
+
+// -- The loop -------------------------------------------------------------------------------------
+
+@test("a loop with nothing on it runs and returns at once")
+empty_loop()
+    val lp = default_loop()
+
+    assert(!lp.run().unwrap(), "nothing was left to wait for")
+    assert(!lp.alive(), "and nothing is alive on it")
+
+@test("a loop of your own is a different loop")
+own_loop()
+    val lp = new_loop().expect("a loop")
+
+    assert(!lp.run().unwrap(), "it runs")
+    assert(lp.close().is_ok(), "and closes, having nothing open on it")
+
+@test("the loop's clock moves")
+loop_clock()
+    val lp = default_loop()
+    val before = lp.now()
+
+    c.sleep_msec(5)
+    lp.update_time()
+
+    assert(lp.now() >= before + 4, "the cached clock caught up after update_time")
+
+// -- Timers ---------------------------------------------------------------------------------------
+
+@test("a one-shot timer fires once and stops")
+one_shot()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+    val n: &Counter = Counter(0)
+
+    t.start(1, 0, () -> n.bump())
+    lp.run().expect("the loop ran")
+
+    assert_eq(n.value, 1)
+    assert(!t.is_active(), "a one-shot is not active once it has fired")
+
+    t.close()
+    lp.run().expect("the close was delivered")
+
+@test("a repeating timer fires until it stops itself")
+repeating()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+    val n: &Counter = Counter(0)
+
+    t.start(0, 1, () ->
+        n.bump()
+        if n.value == 3 then t.close())
+
+    lp.run().expect("the loop ran")
+    assert_eq(n.value, 3)
+
+@test("a timer nothing names still fires, because the loop is holding it")
+unnamed_timer()
+    val lp = default_loop()
+    val n: &Counter = Counter(0)
+
+    start_a_timer_and_forget_it(lp, n)
+    lp.run().expect("the loop ran")
+
+    assert_eq(n.value, 1)
+
+// The timer is created and started inside this call and nothing here keeps a name for it, so the
+// only reference left when it returns is the one the handle holds to itself. If that were not there
+// the storage would be freed and libuv would be writing into it by the time `run` was called.
+private start_a_timer_and_forget_it(lp: &Loop, n: &Counter)
+    val t = timer(lp).expect("a timer")
+
+    t.start(1, 0, () ->
+        n.bump()
+        t.close())
+
+@test("close runs its callback, and after it the handle is gone")
+close_callback()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+    val n: &Counter = Counter(0)
+
+    t.close(() -> n.bump())
+
+    assert(t.is_closing(), "closing starts at once")
+    assert_eq(n.value, 0)
+
+    lp.run().expect("the loop ran")
+    assert_eq(n.value, 1)
+
+@test("unref stops a handle keeping the loop alive")
+unref_lets_the_loop_end()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+
+    t.start(60000, 60000, noop)
+    assert(lp.alive(), "a started timer keeps the loop alive")
+
+    t.unref()
+    assert(!lp.run(RUN_NOWAIT).unwrap(), "and unref takes that away")
+
+    t.keep()
+    assert(lp.alive(), "which keep gives back")
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+// Somewhere for a callback to leave a mark. A closure captures by value, so a counter it is going to
+// increment has to be behind a `&` for the caller to see what happened.
+private struct Counter
+    value: int
+
+    bump(*self) = self.value += 1

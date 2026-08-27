@@ -1,0 +1,108 @@
+// Timers: once, or over and over.
+//
+//     val t = timer()?
+//
+//     t.start(1000, 0, () -> print("a second later"))          // once
+//     t.start(0, 16, () -> frame())                            // now, and every 16ms after
+//
+// **The timeout and the repeat are separate**, which is the shape `setTimeout` and `setInterval`
+// are two functions for elsewhere: the first says how long until the first call, the second how
+// long between the ones after it, and `0` for the second means there are none.
+//
+// Both are milliseconds, measured against the loop's cached clock rather than against a fresh
+// reading -- so a timer is scheduled relative to the top of the loop iteration that started it.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+/** A timer. Reached through `&Timer`, and alive from `timer()` until `close`.
+ *
+ * **Starting a running timer restarts it.** libuv stops it first, so the timeout is measured again
+ * from now and the callback is replaced.
+ */
+struct Timer
+    private storage: [c.TIMER_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Timer]
+    private on_tick: &Fn() -> unit
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.Timer = ptr_cast(&self.storage[0])
+
+    /** The loop this timer is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Call `cb` after `timeout` milliseconds, and every `repeat` milliseconds after that.
+     *
+     * `repeat` of `0` is a one-shot: the timer stops itself before the callback runs, so it is no
+     * longer active and does not keep the loop alive -- though it is still open, and still has to
+     * be closed.
+     *
+     * A `timeout` of `0` means the next turn of the loop, which is how a program hands work back to
+     * the loop before doing it.
+     */
+    start(*self, timeout: u64, repeat: u64, cb: &Fn() -> unit) -> Result[unit, Error]
+        self.on_tick = cb
+        check(c.timer_start(self.raw(), &timer_tick, timeout, repeat))
+
+    /** Stop the timer. The callback is kept, so `again` can restart it. */
+    stop(*self) -> Result[unit, Error] = check(c.timer_stop(self.raw()))
+
+    /** Stop the timer and start it again with its repeat as the new timeout.
+     *
+     * This is the idle-timeout idiom: a connection sets a repeating timer for the timeout it will
+     * allow, and calls `again` on every byte that arrives. `EINVAL` for a timer whose repeat is
+     * `0`, which has no interval to be restarted with.
+     */
+    again(*self) -> Result[unit, Error] = check(c.timer_again(self.raw()))
+
+    /** The repeat interval in milliseconds. */
+    repeat(*self) -> u64 = c.timer_get_repeat(self.raw())
+
+    /** Change the repeat interval.
+     *
+     * **It takes effect after the next callback**, not now: a timer that is already scheduled fires
+     * when it was going to, and the new interval governs from there. Calling `again` from inside
+     * the callback applies it immediately instead.
+     */
+    set_repeat(*self, repeat: u64) = c.timer_set_repeat(self.raw(), repeat)
+
+    /** How many milliseconds until this timer is next due, or `0` if it is not running. */
+    due_in(*self) -> u64 = c.timer_get_due_in(self.raw())
+end Timer
+
+impl Handle for Timer
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.on_tick = noop
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+// libuv hands back the handle it was given, and `set_data` put the address of the sysl `Timer`
+// there when it was created.
+private timer_tick(h: *c.Timer) -> unit
+    val t: *Timer = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    t.on_tick()
+
+/** A timer on `lp`, which is the default loop unless you say otherwise.
+ *
+ * It is not started: `start` decides when and how often. `Err` here means libuv refused to
+ * initialise the handle, which for a timer means the loop was not one.
+ */
+timer(lp: &Loop = default_loop()) -> Result[&Timer, Error]
+    var t: &Timer = Timer([0; c.TIMER_WORDS], lp, None, noop, noop)
+
+    check(c.timer_init(lp.raw(), t.raw()))?
+
+    t.me = Some(t)
+    c.handle_set_data(t.handle_ptr(), ptr_cast(&*t))
+    Ok(t)

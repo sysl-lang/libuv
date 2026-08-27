@@ -1,0 +1,473 @@
+// libuv, declared verbatim.
+//
+// **The declarations over the library the machine has.** Nothing here is meant to be called by a
+// program: every name and every convention is C's, so a handle is storage the caller supplies, a
+// failure is a negative integer, and a callback is one word of code with a `void *` beside it. The
+// module above this one turns those into sysl and is what an application imports.
+//
+// **What decides which module a thing goes in is whether an APPLICATION has to name it, not whether
+// it is a C artifact.** libuv's numbers are `c const` blocks in `constants.sysl` in the module
+// above for exactly that reason — a program spells `RUN_DEFAULT` and `O_RDONLY`, and asking it to
+// import a module documented as "nothing here is meant to be called by a program" to reach them
+// would be the split leaking rather than doing its job. What stayed here are the sizes: the
+// `[N]u64` a handle is carried in is this layer's business and no consumer ever writes one.
+//
+// The split keeps two jobs apart. This one has to be **faithful** — a signature that disagrees with
+// the header links perfectly and corrupts the call at run time, and nothing in this arrangement
+// checks one against the other, so each declaration below was read out of `uv.h` rather than
+// remembered. The other one has to be **pleasant**, which is a different question and would
+// otherwise be answered in the same breath.
+//
+// **The shim is three shapes and nothing else** — a struct whose field order is the platform's
+// rather than libuv's, a struct libuv declares with a union in it, and `uv_buf_t`, which is
+// declared one way round on Unix and the other on Windows. `shim.h` says why each one is there.
+
+module sh.sysl.libuv.c
+@link("uv")
+
+@include("uv.h")
+@include("shim.h")
+
+// ## The handles and the requests
+//
+// Every one of these is a struct libuv publishes the *size* of and not the layout: the caller finds
+// the storage and libuv writes its own fields into it. `opaque struct` is that claim, and it is what
+// stops `timer_start` accepting a socket. The sizes are the `c const` block at the end of this file.
+//
+// **A handle is not relocatable.** Once initialised it is on the loop's queues, which are linked
+// lists through the handle itself, so the storage has to stay where it was — which is why the layer
+// above carries each one inside a `&T` and never inside a value that can be copied.
+
+opaque struct Loop
+
+opaque struct Handle
+opaque struct Stream
+opaque struct Tcp
+opaque struct Pipe
+opaque struct Tty
+opaque struct Timer
+opaque struct Idle
+opaque struct Prepare
+opaque struct Check
+opaque struct Async
+opaque struct Signal
+opaque struct Process
+
+opaque struct Req
+opaque struct Write
+opaque struct Connect
+opaque struct Shutdown
+opaque struct Fs
+opaque struct GetAddrInfo
+
+// `uv_buf_t`, whose two fields swap places between Unix and Windows. It is reached through the shim
+// rather than declared, and this is the type of the storage that holds one.
+opaque struct Buf
+
+// The platform's, not libuv's: `struct sockaddr` and `struct addrinfo`.
+opaque struct SockAddr
+opaque struct AddrInfo
+
+// `uv_stdio_container_t` — a flag word and a union of a stream and a descriptor.
+opaque struct StdioContainer
+
+// `uv_dir_t`, for the `opendir`/`readdir` family. Declared so that `fs_get_ptr` has something to be
+// read as; nothing in the layer above uses it yet.
+opaque struct Dir
+
+// ## The structs libuv defines itself
+//
+// These three are libuv's own layout on every platform — it normalises what the operating system
+// reported into a shape of its own — so they are declared here rather than reached through the shim.
+// `tests.sysl` checks each one's size against C's.
+
+// `uv_timespec_t`. The widths are C's `long`, which is 64 bits on the platforms this package builds
+// for and 32 on a 32-bit one — `long` is sysl's name for the same thing, so the two move together.
+struct Timespec
+    tv_sec: long
+    tv_nsec: long
+
+// `uv_timespec64_t`, which is what `uv_clock_gettime` answers. The seconds are 64 bits whatever the
+// platform, which is the whole reason it exists beside the one above.
+struct Timespec64
+    tv_sec: i64
+    tv_nsec: i32
+
+// `uv_timeval64_t`, which is what `uv_gettimeofday` answers.
+struct Timeval64
+    tv_sec: i64
+    tv_usec: i32
+
+// `uv_stat_t` — twelve unsigned 64-bit fields and four timestamps, whatever the operating system's
+// own `struct stat` looks like.
+struct Stat
+    st_dev: u64
+    st_mode: u64
+    st_nlink: u64
+    st_uid: u64
+    st_gid: u64
+    st_rdev: u64
+    st_ino: u64
+    st_size: u64
+    st_blksize: u64
+    st_blocks: u64
+    st_flags: u64
+    st_gen: u64
+    st_atim: Timespec
+    st_mtim: Timespec
+    st_ctim: Timespec
+    st_birthtim: Timespec
+end Stat
+
+// `uv_dirent_t`, which `fs_scandir_next` fills in one entry at a time.
+struct Dirent
+    name: *u8
+    kind: i32
+
+// `uv_process_options_t`. The `stdio` array is built by the shim, since each element carries a
+// union; everything else here is a pointer or a number.
+struct ProcessOptions
+    exit_cb: *extern(*Process, i64, i32) -> unit
+    file: *u8
+    args: **u8
+    env: **u8
+    cwd: *u8
+    flags: u32
+    stdio_count: i32
+    stdio: *StdioContainer
+    uid: u32
+    gid: u32
+end ProcessOptions
+
+// ## Version and error reporting
+
+extern "uv_version" version() -> u32
+extern "uv_version_string" version_string() -> *u8
+
+extern "uv_strerror" strerror(err: i32) -> *u8
+extern "uv_err_name" err_name(err: i32) -> *u8
+extern "uv_translate_sys_error" translate_sys_error(sys_errno: i32) -> i32
+
+// ## The loop
+
+extern "uv_default_loop" default_loop() -> *Loop
+extern "uv_loop_init" loop_init(l: *Loop) -> i32
+extern "uv_loop_close" loop_close(l: *Loop) -> i32
+extern "uv_loop_size" loop_size() -> usize
+extern "uv_loop_alive" loop_alive(l: *Loop) -> i32
+extern "uv_loop_fork" loop_fork(l: *Loop) -> i32
+
+extern "uv_run" run(l: *Loop, mode: i32) -> i32
+extern "uv_stop" stop(l: *Loop)
+
+extern "uv_update_time" update_time(l: *Loop)
+extern "uv_now" now(l: *Loop) -> u64
+extern "uv_backend_fd" backend_fd(l: *Loop) -> i32
+extern "uv_backend_timeout" backend_timeout(l: *Loop) -> i32
+extern "uv_metrics_idle_time" metrics_idle_time(l: *Loop) -> u64
+
+// ## Every handle
+
+extern "uv_close" close(h: *Handle, cb: *extern(*Handle) -> unit)
+extern "uv_is_active" is_active(h: *Handle) -> i32
+extern "uv_is_closing" is_closing(h: *Handle) -> i32
+extern "uv_ref" handle_ref(h: *Handle)
+extern "uv_unref" unref(h: *Handle)
+extern "uv_has_ref" has_ref(h: *Handle) -> i32
+extern "uv_handle_size" handle_size(kind: i32) -> usize
+extern "uv_handle_get_type" handle_get_type(h: *Handle) -> i32
+extern "uv_handle_type_name" handle_type_name(kind: i32) -> *u8
+extern "uv_handle_get_data" handle_get_data(h: *Handle) -> *u8
+extern "uv_handle_set_data" handle_set_data(h: *Handle, data: *u8)
+extern "uv_handle_get_loop" handle_get_loop(h: *Handle) -> *Loop
+extern "uv_fileno" fileno(h: *Handle, fd: *i32) -> i32
+extern "uv_send_buffer_size" send_buffer_size(h: *Handle, value: *i32) -> i32
+extern "uv_recv_buffer_size" recv_buffer_size(h: *Handle, value: *i32) -> i32
+extern "uv_guess_handle" guess_handle(fd: i32) -> i32
+
+// ## Every request
+
+extern "uv_cancel" cancel(r: *Req) -> i32
+extern "uv_req_size" req_size(kind: i32) -> usize
+extern "uv_req_get_type" req_get_type(r: *Req) -> i32
+extern "uv_req_type_name" req_type_name(kind: i32) -> *u8
+extern "uv_req_get_data" req_get_data(r: *Req) -> *u8
+extern "uv_req_set_data" req_set_data(r: *Req, data: *u8)
+
+// ## Timer
+
+extern "uv_timer_init" timer_init(l: *Loop, h: *Timer) -> i32
+extern "uv_timer_start" timer_start(h: *Timer, cb: *extern(*Timer) -> unit, timeout: u64,
+                                    repeat: u64) -> i32
+extern "uv_timer_stop" timer_stop(h: *Timer) -> i32
+extern "uv_timer_again" timer_again(h: *Timer) -> i32
+extern "uv_timer_set_repeat" timer_set_repeat(h: *Timer, repeat: u64)
+extern "uv_timer_get_repeat" timer_get_repeat(h: *Timer) -> u64
+extern "uv_timer_get_due_in" timer_get_due_in(h: *Timer) -> u64
+
+// ## Idle, prepare and check
+//
+// One shape three times, which is libuv's own arrangement: the three differ only in where in an
+// iteration of the loop they are called.
+
+extern "uv_idle_init" idle_init(l: *Loop, h: *Idle) -> i32
+extern "uv_idle_start" idle_start(h: *Idle, cb: *extern(*Idle) -> unit) -> i32
+extern "uv_idle_stop" idle_stop(h: *Idle) -> i32
+
+extern "uv_prepare_init" prepare_init(l: *Loop, h: *Prepare) -> i32
+extern "uv_prepare_start" prepare_start(h: *Prepare, cb: *extern(*Prepare) -> unit) -> i32
+extern "uv_prepare_stop" prepare_stop(h: *Prepare) -> i32
+
+extern "uv_check_init" check_init(l: *Loop, h: *Check) -> i32
+extern "uv_check_start" check_start(h: *Check, cb: *extern(*Check) -> unit) -> i32
+extern "uv_check_stop" check_stop(h: *Check) -> i32
+
+// ## Async
+//
+// The one handle in libuv that may be touched from another thread, which is what makes it the way a
+// worker wakes the loop up.
+
+extern "uv_async_init" async_init(l: *Loop, h: *Async, cb: *extern(*Async) -> unit) -> i32
+extern "uv_async_send" async_send(h: *Async) -> i32
+
+// ## Signal
+
+extern "uv_signal_init" signal_init(l: *Loop, h: *Signal) -> i32
+extern "uv_signal_start" signal_start(h: *Signal, cb: *extern(*Signal, i32) -> unit,
+                                      signum: i32) -> i32
+extern "uv_signal_start_oneshot" signal_start_oneshot(h: *Signal,
+                                                      cb: *extern(*Signal, i32) -> unit,
+                                                      signum: i32) -> i32
+extern "uv_signal_stop" signal_stop(h: *Signal) -> i32
+extern "uv_kill" kill(pid: i32, signum: i32) -> i32
+
+// ## Stream
+//
+// What TCP, a pipe and a TTY have in common. A `*Tcp` is a `*Stream` is a `*Handle` in C, by the
+// first-member trick every libuv handle is built on; on this side the casts are written out.
+
+extern "uv_listen" listen(h: *Stream, backlog: i32, cb: *extern(*Stream, i32) -> unit) -> i32
+extern "uv_accept" accept(server: *Stream, client: *Stream) -> i32
+extern "uv_read_start" read_start(h: *Stream, alloc_cb: *extern(*Handle, usize, *Buf) -> unit,
+                                  read_cb: *extern(*Stream, isize, *Buf) -> unit) -> i32
+extern "uv_read_stop" read_stop(h: *Stream) -> i32
+extern "uv_write" write(req: *Write, h: *Stream, bufs: *Buf, nbufs: u32,
+                        cb: *extern(*Write, i32) -> unit) -> i32
+extern "uv_try_write" try_write(h: *Stream, bufs: *Buf, nbufs: u32) -> i32
+extern "uv_shutdown" shutdown(req: *Shutdown, h: *Stream, cb: *extern(*Shutdown, i32) -> unit) -> i32
+extern "uv_is_readable" is_readable(h: *Stream) -> i32
+extern "uv_is_writable" is_writable(h: *Stream) -> i32
+extern "uv_stream_set_blocking" stream_set_blocking(h: *Stream, blocking: i32) -> i32
+extern "uv_stream_get_write_queue_size" stream_get_write_queue_size(h: *Stream) -> usize
+
+// ## TCP
+
+extern "uv_tcp_init" tcp_init(l: *Loop, h: *Tcp) -> i32
+extern "uv_tcp_open" tcp_open(h: *Tcp, sock: i32) -> i32
+extern "uv_tcp_nodelay" tcp_nodelay(h: *Tcp, enable: i32) -> i32
+extern "uv_tcp_keepalive" tcp_keepalive(h: *Tcp, enable: i32, delay: u32) -> i32
+extern "uv_tcp_simultaneous_accepts" tcp_simultaneous_accepts(h: *Tcp, enable: i32) -> i32
+extern "uv_tcp_bind" tcp_bind(h: *Tcp, addr: *SockAddr, flags: u32) -> i32
+extern "uv_tcp_connect" tcp_connect(req: *Connect, h: *Tcp, addr: *SockAddr,
+                                    cb: *extern(*Connect, i32) -> unit) -> i32
+extern "uv_tcp_getsockname" tcp_getsockname(h: *Tcp, name: *SockAddr, namelen: *i32) -> i32
+extern "uv_tcp_getpeername" tcp_getpeername(h: *Tcp, name: *SockAddr, namelen: *i32) -> i32
+extern "uv_tcp_close_reset" tcp_close_reset(h: *Tcp, cb: *extern(*Handle) -> unit) -> i32
+
+// ## Pipe
+
+extern "uv_pipe_init" pipe_init(l: *Loop, h: *Pipe, ipc: i32) -> i32
+extern "uv_pipe_open" pipe_open(h: *Pipe, file: i32) -> i32
+extern "uv_pipe_bind2" pipe_bind2(h: *Pipe, name: *u8, namelen: usize, flags: u32) -> i32
+extern "uv_pipe_connect2" pipe_connect2(req: *Connect, h: *Pipe, name: *u8, namelen: usize,
+                                        flags: u32, cb: *extern(*Connect, i32) -> unit) -> i32
+extern "uv_pipe_getsockname" pipe_getsockname(h: *Pipe, buffer: *u8, size: *usize) -> i32
+extern "uv_pipe_getpeername" pipe_getpeername(h: *Pipe, buffer: *u8, size: *usize) -> i32
+extern "uv_pipe_chmod" pipe_chmod(h: *Pipe, flags: i32) -> i32
+extern "uv_pipe" pipe_pair(fds: *i32, read_flags: i32, write_flags: i32) -> i32
+
+// ## TTY
+
+extern "uv_tty_init" tty_init(l: *Loop, h: *Tty, fd: i32, unused: i32) -> i32
+extern "uv_tty_set_mode" tty_set_mode(h: *Tty, mode: i32) -> i32
+extern "uv_tty_reset_mode" tty_reset_mode() -> i32
+extern "uv_tty_get_winsize" tty_get_winsize(h: *Tty, width: *i32, height: *i32) -> i32
+
+// ## Addresses
+
+extern "uv_ip4_addr" ip4_addr(ip: *u8, port: i32, addr: *SockAddr) -> i32
+extern "uv_ip6_addr" ip6_addr(ip: *u8, port: i32, addr: *SockAddr) -> i32
+extern "uv_ip_name" ip_name(src: *SockAddr, dst: *u8, size: usize) -> i32
+extern "uv_inet_ntop" inet_ntop(af: i32, src: *u8, dst: *u8, size: usize) -> i32
+extern "uv_inet_pton" inet_pton(af: i32, src: *u8, dst: *u8) -> i32
+extern "uv_if_indextoname" if_indextoname(ifindex: u32, buffer: *u8, size: *usize) -> i32
+
+// ## Name resolution
+
+extern "uv_getaddrinfo" getaddrinfo(l: *Loop, req: *GetAddrInfo,
+                                    cb: *extern(*GetAddrInfo, i32, *AddrInfo) -> unit,
+                                    node: *u8, service: *u8, hints: *AddrInfo) -> i32
+extern "uv_freeaddrinfo" freeaddrinfo(ai: *AddrInfo)
+
+// ## The file system
+//
+// Every one of these takes a callback and a request. **Passing `null` for the callback makes the
+// call synchronous**, which is libuv's own rule and is what the blocking half of the layer above is
+// built on.
+
+extern "uv_fs_req_cleanup" fs_req_cleanup(req: *Fs)
+extern "uv_fs_get_result" fs_get_result(req: *Fs) -> isize
+extern "uv_fs_get_system_error" fs_get_system_error(req: *Fs) -> i32
+extern "uv_fs_get_ptr" fs_get_ptr(req: *Fs) -> *u8
+extern "uv_fs_get_path" fs_get_path(req: *Fs) -> *u8
+extern "uv_fs_get_type" fs_get_type(req: *Fs) -> i32
+extern "uv_fs_get_statbuf" fs_get_statbuf(req: *Fs) -> *Stat
+
+extern "uv_fs_open" fs_open(l: *Loop, req: *Fs, path: *u8, flags: i32, mode: i32,
+                            cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_close" fs_close(l: *Loop, req: *Fs, file: i32, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_read" fs_read(l: *Loop, req: *Fs, file: i32, bufs: *Buf, nbufs: u32, offset: i64,
+                            cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_write" fs_write(l: *Loop, req: *Fs, file: i32, bufs: *Buf, nbufs: u32, offset: i64,
+                              cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_unlink" fs_unlink(l: *Loop, req: *Fs, path: *u8, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_mkdir" fs_mkdir(l: *Loop, req: *Fs, path: *u8, mode: i32,
+                              cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_rmdir" fs_rmdir(l: *Loop, req: *Fs, path: *u8, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_mkdtemp" fs_mkdtemp(l: *Loop, req: *Fs, tpl: *u8, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_rename" fs_rename(l: *Loop, req: *Fs, path: *u8, new_path: *u8,
+                                cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_stat" fs_stat(l: *Loop, req: *Fs, path: *u8, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_lstat" fs_lstat(l: *Loop, req: *Fs, path: *u8, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_fstat" fs_fstat(l: *Loop, req: *Fs, file: i32, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_fsync" fs_fsync(l: *Loop, req: *Fs, file: i32, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_fdatasync" fs_fdatasync(l: *Loop, req: *Fs, file: i32,
+                                      cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_ftruncate" fs_ftruncate(l: *Loop, req: *Fs, file: i32, offset: i64,
+                                      cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_access" fs_access(l: *Loop, req: *Fs, path: *u8, mode: i32,
+                                cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_chmod" fs_chmod(l: *Loop, req: *Fs, path: *u8, mode: i32,
+                              cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_copyfile" fs_copyfile(l: *Loop, req: *Fs, path: *u8, new_path: *u8, flags: i32,
+                                    cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_sendfile" fs_sendfile(l: *Loop, req: *Fs, out_fd: i32, in_fd: i32, in_offset: i64,
+                                    length: usize, cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_realpath" fs_realpath(l: *Loop, req: *Fs, path: *u8,
+                                    cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_readlink" fs_readlink(l: *Loop, req: *Fs, path: *u8,
+                                    cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_symlink" fs_symlink(l: *Loop, req: *Fs, path: *u8, new_path: *u8, flags: i32,
+                                  cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_link" fs_link(l: *Loop, req: *Fs, path: *u8, new_path: *u8,
+                            cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_scandir" fs_scandir(l: *Loop, req: *Fs, path: *u8, flags: i32,
+                                  cb: *extern(*Fs) -> unit) -> i32
+extern "uv_fs_scandir_next" fs_scandir_next(req: *Fs, ent: *Dirent) -> i32
+
+// ## Processes
+
+extern "uv_spawn" spawn(l: *Loop, h: *Process, options: *ProcessOptions) -> i32
+extern "uv_process_kill" process_kill(h: *Process, signum: i32) -> i32
+extern "uv_process_get_pid" process_get_pid(h: *Process) -> i32
+extern "uv_disable_stdio_inheritance" disable_stdio_inheritance()
+
+// ## The machine
+
+extern "uv_hrtime" hrtime() -> u64
+extern "uv_sleep" sleep_msec(msec: u32)
+extern "uv_gettimeofday" gettimeofday(tv: *Timeval64) -> i32
+extern "uv_clock_gettime" clock_gettime(clock_id: i32, ts: *Timespec64) -> i32
+extern "uv_uptime" uptime(seconds: *f64) -> i32
+extern "uv_loadavg" loadavg(avg: *f64)
+extern "uv_resident_set_memory" resident_set_memory(rss: *usize) -> i32
+extern "uv_get_free_memory" get_free_memory() -> u64
+extern "uv_get_total_memory" get_total_memory() -> u64
+extern "uv_get_constrained_memory" get_constrained_memory() -> u64
+extern "uv_get_available_memory" get_available_memory() -> u64
+extern "uv_available_parallelism" available_parallelism() -> u32
+extern "uv_cpumask_size" cpumask_size() -> i32
+
+extern "uv_cwd" cwd(buffer: *u8, size: *usize) -> i32
+extern "uv_chdir" chdir(dir: *u8) -> i32
+extern "uv_exepath" exepath(buffer: *u8, size: *usize) -> i32
+extern "uv_os_homedir" os_homedir(buffer: *u8, size: *usize) -> i32
+extern "uv_os_tmpdir" os_tmpdir(buffer: *u8, size: *usize) -> i32
+extern "uv_os_gethostname" os_gethostname(buffer: *u8, size: *usize) -> i32
+extern "uv_os_getenv" os_getenv(name: *u8, buffer: *u8, size: *usize) -> i32
+extern "uv_os_setenv" os_setenv(name: *u8, value: *u8) -> i32
+extern "uv_os_unsetenv" os_unsetenv(name: *u8) -> i32
+extern "uv_os_getpid" os_getpid() -> i32
+extern "uv_os_getppid" os_getppid() -> i32
+extern "uv_os_getpriority" os_getpriority(pid: i32, priority: *i32) -> i32
+extern "uv_os_setpriority" os_setpriority(pid: i32, priority: i32) -> i32
+
+// ## The shim
+//
+// `shim.h` says why each of these exists. They are the three shapes C reaches and sysl does not: a
+// platform's field order, a union, and a struct whose declaration order depends on the operating
+// system.
+
+extern "sysl_uv_buf_set" buf_set(b: *Buf, base: *u8, len: usize)
+extern "sysl_uv_buf_base" buf_base(b: *Buf) -> *u8
+extern "sysl_uv_buf_len" buf_len(b: *Buf) -> usize
+
+extern "sysl_uv_sockaddr_family" sockaddr_family(addr: *SockAddr) -> i32
+extern "sysl_uv_sockaddr_port" sockaddr_port(addr: *SockAddr) -> i32
+
+extern "sysl_uv_hints_init" hints_init(hints: *AddrInfo, family: i32, socktype: i32, protocol: i32,
+                                       flags: i32)
+extern "sysl_uv_ai_next" ai_next(ai: *AddrInfo) -> *AddrInfo
+extern "sysl_uv_ai_family" ai_family(ai: *AddrInfo) -> i32
+extern "sysl_uv_ai_socktype" ai_socktype(ai: *AddrInfo) -> i32
+extern "sysl_uv_ai_protocol" ai_protocol(ai: *AddrInfo) -> i32
+extern "sysl_uv_ai_addr" ai_addr(ai: *AddrInfo) -> *SockAddr
+extern "sysl_uv_ai_canonname" ai_canonname(ai: *AddrInfo) -> *u8
+
+extern "sysl_uv_stdio_set_fd" stdio_set_fd(stdio: *StdioContainer, i: i32, flags: i32, fd: i32)
+extern "sysl_uv_stdio_set_stream" stdio_set_stream(stdio: *StdioContainer, i: i32, flags: i32,
+                                                   stream: *Stream)
+
+// ## The sizes
+//
+// **Asked for rather than written down**, and asked for in *words* rather than bytes. A handle is
+// carried above in a `[N]u64`, and an array of `u64` is 8-aligned by construction where a `[N]u8`
+// promises nothing — libuv's handles hold pointers and 64-bit counters, so a misaligned one is a
+// fault on a target that cares and silent corruption on one that does not.
+//
+// `sizeof` for the target being built for is what a `c const` block measures, so cross-compiling
+// changes these without anything here being edited.
+
+c const
+    LOOP_WORDS: usize = "(sizeof(uv_loop_t) + 7) / 8"
+
+    TCP_WORDS: usize = "(sizeof(uv_tcp_t) + 7) / 8"
+    PIPE_WORDS: usize = "(sizeof(uv_pipe_t) + 7) / 8"
+    TTY_WORDS: usize = "(sizeof(uv_tty_t) + 7) / 8"
+    TIMER_WORDS: usize = "(sizeof(uv_timer_t) + 7) / 8"
+    IDLE_WORDS: usize = "(sizeof(uv_idle_t) + 7) / 8"
+    PREPARE_WORDS: usize = "(sizeof(uv_prepare_t) + 7) / 8"
+    CHECK_WORDS: usize = "(sizeof(uv_check_t) + 7) / 8"
+    ASYNC_WORDS: usize = "(sizeof(uv_async_t) + 7) / 8"
+    SIGNAL_WORDS: usize = "(sizeof(uv_signal_t) + 7) / 8"
+    PROCESS_WORDS: usize = "(sizeof(uv_process_t) + 7) / 8"
+
+    WRITE_WORDS: usize = "(sizeof(uv_write_t) + 7) / 8"
+    CONNECT_WORDS: usize = "(sizeof(uv_connect_t) + 7) / 8"
+    SHUTDOWN_WORDS: usize = "(sizeof(uv_shutdown_t) + 7) / 8"
+    FS_WORDS: usize = "(sizeof(uv_fs_t) + 7) / 8"
+    GETADDRINFO_WORDS: usize = "(sizeof(uv_getaddrinfo_t) + 7) / 8"
+
+    BUF_WORDS: usize = "(sizeof(uv_buf_t) + 7) / 8"
+    SOCKADDR_WORDS: usize = "(sizeof(struct sockaddr_storage) + 7) / 8"
+    ADDRINFO_WORDS: usize = "(sizeof(struct addrinfo) + 7) / 8"
+    STDIO_WORDS: usize = "(sizeof(uv_stdio_container_t) + 7) / 8"
+
+// The sizes of the three structs declared above, for the tests that check this side against C's.
+c const
+    C_STAT_SIZE: usize = "sizeof(uv_stat_t)"
+    C_DIRENT_SIZE: usize = "sizeof(uv_dirent_t)"
+    C_PROCESS_OPTIONS_SIZE: usize = "sizeof(uv_process_options_t)"
+    C_TIMESPEC_SIZE: usize = "sizeof(uv_timespec_t)"
+    C_TIMEVAL64_SIZE: usize = "sizeof(uv_timeval64_t)"
+    C_TIMESPEC64_SIZE: usize = "sizeof(uv_timespec64_t)"

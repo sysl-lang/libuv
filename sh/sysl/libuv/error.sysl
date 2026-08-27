@@ -1,0 +1,65 @@
+// What libuv says went wrong.
+//
+// **Every failure in libuv is one negative integer**, and the library carries its own name and its
+// own sentence for each of them. That is unusually good for a C library and it is why this package
+// does not enumerate them: an `enum` of libuv's eighty-odd codes would be a transcription that goes
+// out of date, and it would answer worse than `uv_err_name` already does for the one that is not in
+// it.
+//
+// So an `Error` is the code, and the two strings are asked for when somebody wants them:
+//
+//     lp.tcp()?.bind(addr) match
+//         Ok(_) -> ...
+//         Err(e) -> print(s"cannot bind: $e")       // "EADDRINUSE: address already in use"
+//
+// **Comparing is by code**, which is what makes `if e.code == EOF` the one form a program acting on
+// a failure writes. The codes a program actually acts on are in `constants.sysl`.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.text.from_cstring
+
+/** A libuv failure. `code` is the negative number libuv answered with; the two strings are libuv's
+ * own, fetched from the library rather than kept here.
+ */
+struct Error
+    code: i32
+
+    /** libuv's short name for the code -- `EOF`, `ECONNRESET`, `ENOENT`. */
+    name(self) -> string = from_cstring(c.err_name(self.code)).unwrap_or("UNKNOWN")
+
+    /** libuv's sentence for the code -- "end of file", "connection reset by peer". */
+    message(self) -> string = from_cstring(c.strerror(self.code)).unwrap_or("unknown error")
+end Error
+
+/** An error renders as `NAME: message`, which is the form a log line wants and the form the
+ * `expect` of a `Result` prints on the way out.
+ */
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) =
+        display_str(self.name() + ": " + self.message(), out, fmt)
+
+/** Two errors are the same error when they are the same code. */
+impl Eq for Error
+    eq(self, rhs: Error) -> bool = self.code == rhs.code
+
+/** A libuv return value read as a `Result`: anything below zero is the failure it names, and
+ * everything else is success with nothing to carry.
+ *
+ * This is the shape almost every call in this package answers with, since almost every call in
+ * libuv answers `0` or a negative code.
+ */
+check(code: i32) -> Result[unit, Error] = if code < 0 then Err(Error(code)) else Ok(())
+
+/** The same, for the calls that answer a count on the way through -- `try_write` and the file
+ * system's reads and writes, where the number is the answer and only a negative one is a failure.
+ */
+check_count(code: isize) -> Result[usize, Error] =
+    if code < 0 then Err(Error(i32(code))) else Ok(usize(code))
+
+/** The error a code names, for a callback that is handed one. libuv reports a failed connection, a
+ * failed write and the end of a stream through the status argument rather than through a return
+ * value, and this is what turns one of those into the same `Error` everything else answers with.
+ */
+error_of(code: i32) -> Error = Error(code)

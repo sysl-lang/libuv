@@ -1,0 +1,152 @@
+// What every handle can do, and the rule about lifetime that makes the rest of this package work.
+//
+// ## A handle stays alive until you close it
+//
+// libuv's loop owns the handles on it: it keeps them on its own queues, writes into them from the
+// backend, and hands them to callbacks. A refcounted language has to say what keeps that storage
+// alive, and the answer here is that **a handle holds a reference to itself from the moment it is
+// created until `close` finishes.** Three things follow, and all three are what a program wants:
+//
+//     timer()?.start(1000, 0, () -> print("later"))     // nothing binds it, and it still fires
+//
+// - A handle need not be bound to a name. The loop is holding it.
+// - Dropping the last name for a handle does not stop it, exactly as dropping a `setInterval`
+//   handle in JavaScript does not.
+// - **`close` is what ends it**, and a handle never closed is a handle never freed -- which is also
+//   what keeps `run` from returning, since an open handle is something the loop is still waiting
+//   for. That is libuv's own rule and this binding does not soften it.
+//
+// ## A callback is handed nothing
+//
+// `t.start(0, 1000, () -> ...)` takes a closure of no arguments, and so does every other callback
+// in this package that has nothing of its own to report. A closure captures, so a callback that
+// needs the handle captures the handle -- which is the same reference the loop is holding, and
+// costs nothing.
+//
+//     val t = timer()?
+//
+//     t.start(0, 100, () ->
+//         n += 1
+//         if n == 3 then t.close())
+//
+// **That closure and the handle refer to each other**, which is a cycle a counted language does not
+// collect. `close` is what breaks it: closing drops the callbacks and the handle's reference to
+// itself, so the box goes when the last name for it does. A program that closes its handles leaks
+// nothing, and one that does not was never going to return from `run` anyway.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+// The callback a handle carries when it has none: something has to be in the field, and a closure
+// that does nothing is cheaper to call than an `Option` is to test.
+private[libuv] noop() -> unit = ()
+
+/** What every libuv handle answers to. A timer, a socket, a signal watcher and an idle watcher are
+ * all one of these, which is what lets `close`, `is_active` and the two reference calls be written
+ * once.
+ *
+ * **Three of its members are this package's plumbing rather than a program's business** --
+ * `handle_ptr` is the address libuv knows the handle by, and `finish_close` is what a close
+ * callback runs. They are declared here because a trait cannot hide a member from the type that
+ * implements it, and there is nothing useful to do with either.
+ */
+trait Handle
+    /** The address libuv knows this handle by. */
+    handle_ptr(*self) -> *c.Handle
+
+    /** Run when libuv has finished closing this handle: drop every callback and the handle's own
+     * reference to itself, then call whatever `close` was given.
+     *
+     * **Nothing may touch the handle after the self-reference goes**, since that may have been the
+     * last one -- which is why every implementation of this reads its callback into a local first.
+     */
+    finish_close(*self)
+
+    /** Whether the handle is doing anything -- started, listening, connected. What "active" means
+     * exactly is per handle, and libuv's own documentation is the place for the detail.
+     */
+    is_active(*self) -> bool = c.is_active(self.handle_ptr()) != 0
+
+    /** Whether `close` has been called and not yet finished. Calling `close` twice is a libuv
+     * assertion failure rather than an error, so this is the guard where a program is not sure.
+     */
+    is_closing(*self) -> bool = c.is_closing(self.handle_ptr()) != 0
+
+    /** Stop this handle from keeping the loop alive.
+     *
+     * A loop runs until nothing is open, so a repeating timer that only reports statistics would
+     * keep a program running forever. `unref` says "wait for the others, not for me" -- the handle
+     * goes on working and simply stops counting.
+     */
+    unref(*self) = c.unref(self.handle_ptr())
+
+    /** Undo `unref`: this handle counts again. libuv spells this one `uv_ref`, which is a word
+     * sysl has already taken.
+     */
+    keep(*self) = c.handle_ref(self.handle_ptr())
+
+    /** Whether this handle is one the loop waits for. */
+    has_ref(*self) -> bool = c.has_ref(self.handle_ptr()) != 0
+
+    /** The operating system's descriptor for this handle, for a program that has to hand it to
+     * something outside libuv. `EINVAL` for a handle with no descriptor and `EBADF` for one that
+     * has been closed.
+     *
+     * **What comes back belongs to libuv.** Closing it, or doing anything to it that libuv does not
+     * expect, breaks the handle.
+     */
+    fileno(*self) -> Result[i32, Error]
+        var fd: i32 = -1
+
+        check(c.fileno(self.handle_ptr(), &fd))?
+        Ok(fd)
+
+    /** How much the operating system will buffer on the way out, in bytes. `0` asks; anything else
+     * sets. TCP and UDP only.
+     */
+    send_buffer_size(*self, value: i32 = 0) -> Result[i32, Error]
+        var v = value
+
+        check(c.send_buffer_size(self.handle_ptr(), &v))?
+        Ok(v)
+
+    /** The same, on the way in. */
+    recv_buffer_size(*self, value: i32 = 0) -> Result[i32, Error]
+        var v = value
+
+        check(c.recv_buffer_size(self.handle_ptr(), &v))?
+        Ok(v)
+
+    /** Close the handle, and call `cb` once libuv is finished with it.
+     *
+     * **This is the end of the handle**: nothing may be started on it afterwards, and closing twice
+     * is an assertion failure inside libuv rather than an error this side can report. It is also
+     * the only thing that releases the handle's storage, and the only thing that lets a loop with
+     * nothing else open return from `run`.
+     *
+     * The callback is where a program frees whatever it had attached to this handle -- and where a
+     * server that is shutting down notices the last connection has gone.
+     */
+    close(*self, cb: &Fn() -> unit = noop)
+        self.set_close_callback(cb)
+        c.close(self.handle_ptr(), &handle_closed[Self])
+
+    /** Where `close` puts the callback it was given. Plumbing, for the reason `finish_close` is. */
+    set_close_callback(*self, cb: &Fn() -> unit)
+end Handle
+
+// The one close callback, instantiated per handle type. libuv hands back the address it was given,
+// which is the address of the sysl handle -- so reading the type parameter off it is the promise
+// `set_data` made at creation and nothing more.
+private handle_closed[H: Handle](h: *c.Handle) -> unit
+    val p: *H = ptr_cast(c.handle_get_data(h))
+
+    p.finish_close()
+
+/** What a descriptor turns out to be, without opening anything: `HANDLE_TTY`, `HANDLE_NAMED_PIPE`,
+ * `HANDLE_FILE`, `HANDLE_TCP`, `HANDLE_UDP`, or `UNKNOWN_HANDLE`.
+ *
+ * This is how a program decides whether its standard input is worth putting in raw mode.
+ */
+guess_handle(fd: i32) -> i32 = c.guess_handle(fd)

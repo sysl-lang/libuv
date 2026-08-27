@@ -1,0 +1,129 @@
+// The event loop, which is the thing everything else in this package is attached to.
+//
+// **`default_loop()` is the one most programs want.** libuv keeps a loop of its own in static
+// storage, started lazily, and a program with one loop should use it rather than making a second:
+// signals, the thread pool and the child-process reaper are shared, and libuv's own documentation
+// says the default is what a single-loop program is meant to reach for.
+//
+//     val lp = default_loop()
+//
+//     lp.timer().start(1000, 0, () -> print("a second later"))
+//     lp.run()?
+//
+// **A loop of your own is `new_loop()`**, which is what a second thread needs -- a loop may only be
+// run from one thread, and it is the handles' owner rather than a global.
+//
+// **`run` is where a program spends its life.** It returns when there is nothing left to wait for:
+// no handles open, no requests outstanding, or `stop` called from inside a callback. That "no
+// handles open" is worth reading twice, because it is what makes `close` load-bearing in this
+// binding -- a handle you never closed keeps `run` from ever returning, exactly as it does in C.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.slices.as_mut_ptr
+
+/** An event loop. Reached through `&Loop`, which is what keeps it alive for as long as any handle
+ * attached to it is.
+ *
+ * **The storage is inside this box and never moves.** libuv's loop holds queues that are linked
+ * lists through the handles on them, so neither the loop nor a handle may be relocated once it is
+ * initialised -- which is why every one of them in this package is a `&T` and none of them is a
+ * value a program can copy.
+ */
+struct Loop
+    // libuv's own `uv_loop_t`, in a slice this box owns. It is empty for the default loop, whose
+    // storage belongs to the library.
+    private storage: []u64
+    private p: *c.Loop
+
+    private[libuv] raw(*self) -> *c.Loop = self.p
+
+    /** Run the loop, and answer whether anything is still waiting.
+     *
+     * `RUN_DEFAULT` -- the default -- runs until nothing is left, which is what a program that *is*
+     * an event loop calls once and returns from at the end. `RUN_ONCE` waits for one thing and
+     * handles it. `RUN_NOWAIT` handles whatever is already ready and returns immediately, which is
+     * how a loop is driven from inside somebody else's.
+     *
+     * `Ok(true)` means there are still handles or requests alive, which is the answer `RUN_ONCE`
+     * and `RUN_NOWAIT` are usually asked for.
+     */
+    run(*self, mode: i32 = RUN_DEFAULT) -> Result[bool, Error]
+        val r = c.run(self.p, mode)
+
+        if r < 0 then Err(Error(r)) else Ok(r > 0)
+
+    /** Ask the loop to return from `run` at the first opportunity. Called from inside a callback --
+     * from anywhere else there is nothing running to stop.
+     *
+     * It does not close anything: handles left open are still open, and a later `run` picks up
+     * where this one left off.
+     */
+    stop(*self) = c.stop(self.p)
+
+    /** Whether there is anything for `run` to do -- an open handle, or a request in flight. */
+    alive(*self) -> bool = c.loop_alive(self.p) != 0
+
+    /** The loop's idea of now, in milliseconds, cached at the top of each iteration.
+     *
+     * It is the number timers are scheduled against, so it is the one to subtract when measuring
+     * how long a callback has been waiting. Reading the clock properly is `hrtime()`.
+     */
+    now(*self) -> u64 = c.now(self.p)
+
+    /** Re-read the clock. Only needed inside a callback that has blocked for a long time and wants
+     * the timers it then starts scheduled against the real now rather than the cached one.
+     */
+    update_time(*self) = c.update_time(self.p)
+
+    /** How long the loop is about to sleep for, in milliseconds, or `-1` for "until something
+     * happens". What an embedder polls when it is driving this loop from inside another.
+     */
+    backend_timeout(*self) -> i32 = c.backend_timeout(self.p)
+
+    /** The descriptor the backend waits on -- an epoll or kqueue fd. `-1` where the platform has
+     * no such thing. The other half of what an embedder needs.
+     */
+    backend_fd(*self) -> i32 = c.backend_fd(self.p)
+
+    /** How long the loop has spent idle, in nanoseconds. Only counted when the loop was built with
+     * metrics on, which is the default; it answers `0` otherwise rather than failing.
+     */
+    idle_time(*self) -> u64 = c.metrics_idle_time(self.p)
+
+    /** Release a loop of your own. **Not for the default loop**, and not for a loop with anything
+     * still open on it: libuv answers `EBUSY` for both, and nothing is released.
+     *
+     * The ordinary way to release a loop is to close every handle on it and let `run` return; this
+     * is the call that then frees what libuv allocated inside it.
+     */
+    close(*self) -> Result[unit, Error] = check(c.loop_close(self.p))
+
+    /** Prepare this loop to be used again in a process that has just forked.
+     *
+     * Only the child calls it, and only before it does anything else with the loop. Some backends
+     * carry state a `fork` invalidates, and this is what rebuilds it.
+     */
+    fork(*self) -> Result[unit, Error] = check(c.loop_fork(self.p))
+end Loop
+
+/** libuv's own loop, which is what a single-threaded program should use.
+ *
+ * Calling this twice gives two boxes over the *same* loop, which is harmless -- neither carries
+ * storage of its own -- but a program usually binds it once and passes it around.
+ */
+default_loop() -> &Loop = Loop([0; 0], c.default_loop())
+
+/** A loop of your own, for a second thread or for a library that must not touch the program's.
+ *
+ * `Err` here means libuv could not build the loop's backend, which on a healthy machine means it
+ * ran out of descriptors.
+ */
+new_loop() -> Result[&Loop, Error]
+    var l: &Loop = Loop([0; c.LOOP_WORDS], null)
+
+    l.p = ptr_cast(as_mut_ptr(l.storage))
+
+    check(c.loop_init(l.p))?
+    Ok(l)

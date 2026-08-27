@@ -1,0 +1,232 @@
+// libuv's own numbers, asked for rather than written down.
+//
+// **These are in the pleasant layer on purpose**, though every one of them is a `c const` and this
+// file therefore carries header clauses. The split between the two modules is about what an
+// *application* has to do, not about where a C artifact may sit: a program that opens a file names
+// `O_RDONLY`, and one that catches Ctrl-C names `SIGINT`. Asking it to import a module documented
+// as "nothing here is meant to be called by a program" to reach them would be the split leaking
+// rather than doing its job.
+//
+// **`@include` is a property of the FILE, not of the module**, which is why every `c const` in this
+// package lives in one of two files rather than beside the calls it belongs to. A second file of
+// this module writing a `c const` block with no header clause of its own is refused by the C
+// compiler, naming the identifier rather than the missing include.
+//
+// Each is what the C compiler computes for libuv's own name, out of the headers named below, on the
+// target being built for. A transcribed constant is correct on one machine with nothing checking
+// it; these are correct wherever they are compiled.
+//
+// **The error codes are here and are not what a program usually reads.** `Error` compares by name
+// and prints libuv's own message, so `if e.code == EOF` is the exception rather than the rule --
+// but "did the peer hang up" is exactly the question a server asks, and it needs the number.
+
+module sh.sysl.libuv
+
+@include("uv.h")
+@include("<netdb.h>")
+@include("<signal.h>")
+@include("<sys/socket.h>")
+@include("<sys/stat.h>")
+@include("<unistd.h>")
+
+// ## What `run` does before it returns
+
+// Run until nothing is left: no handles, no requests, or `stop` was called. This is the mode a
+// program that *is* an event loop uses, and it is the default `run` takes.
+c const
+    RUN_DEFAULT: i32 = "UV_RUN_DEFAULT"
+
+// Wait for one thing to happen, do it, and return. Blocks if nothing is ready.
+c const
+    RUN_ONCE: i32 = "UV_RUN_ONCE"
+
+// Do whatever is ready and return immediately. This is the mode that lets a loop be driven from
+// inside somebody else's -- a frame loop, a REPL, a game.
+c const
+    RUN_NOWAIT: i32 = "UV_RUN_NOWAIT"
+
+// ## Failures
+//
+// Every libuv failure is a negative number, and these are the ones a program acts on rather than
+// reports. The rest are reached through `Error`, which has libuv's own name and message for any of
+// them.
+
+c const
+    EOF: i32 = "UV_EOF"
+    EAGAIN: i32 = "UV_EAGAIN"
+    ECANCELED: i32 = "UV_ECANCELED"
+    EEXIST: i32 = "UV_EEXIST"
+    ENOENT: i32 = "UV_ENOENT"
+    EACCES: i32 = "UV_EACCES"
+    EADDRINUSE: i32 = "UV_EADDRINUSE"
+    EADDRNOTAVAIL: i32 = "UV_EADDRNOTAVAIL"
+    EBADF: i32 = "UV_EBADF"
+    ECONNABORTED: i32 = "UV_ECONNABORTED"
+    ECONNREFUSED: i32 = "UV_ECONNREFUSED"
+    ECONNRESET: i32 = "UV_ECONNRESET"
+    EINVAL: i32 = "UV_EINVAL"
+    EISDIR: i32 = "UV_EISDIR"
+    EMFILE: i32 = "UV_EMFILE"
+    ENOTDIR: i32 = "UV_ENOTDIR"
+    ENOTEMPTY: i32 = "UV_ENOTEMPTY"
+    ENOSYS: i32 = "UV_ENOSYS"
+    EPIPE: i32 = "UV_EPIPE"
+    ETIMEDOUT: i32 = "UV_ETIMEDOUT"
+    ENOTSUP: i32 = "UV_ENOTSUP"
+
+// ## Opening a file
+//
+// **libuv's own flags, not the platform's.** `UV_FS_O_*` is the same number wherever it is
+// compiled, where `O_CREAT` is `0x40` on Linux and `0x200` here -- which is a difference that
+// compiles and links on both and opens the wrong thing on one.
+
+c const
+    O_RDONLY: i32 = "UV_FS_O_RDONLY"
+    O_WRONLY: i32 = "UV_FS_O_WRONLY"
+    O_RDWR: i32 = "UV_FS_O_RDWR"
+    O_APPEND: i32 = "UV_FS_O_APPEND"
+    O_CREAT: i32 = "UV_FS_O_CREAT"
+    O_EXCL: i32 = "UV_FS_O_EXCL"
+    O_TRUNC: i32 = "UV_FS_O_TRUNC"
+    O_SYNC: i32 = "UV_FS_O_SYNC"
+    O_DSYNC: i32 = "UV_FS_O_DSYNC"
+    O_DIRECTORY: i32 = "UV_FS_O_DIRECTORY"
+    O_NOFOLLOW: i32 = "UV_FS_O_NOFOLLOW"
+    O_NONBLOCK: i32 = "UV_FS_O_NONBLOCK"
+
+// The permission bits a file is created with, which are the operating system's rather than libuv's.
+// `S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH` is the ordinary 0644.
+c const
+    S_IRUSR: i32 = "S_IRUSR"
+    S_IWUSR: i32 = "S_IWUSR"
+    S_IXUSR: i32 = "S_IXUSR"
+    S_IRGRP: i32 = "S_IRGRP"
+    S_IWGRP: i32 = "S_IWGRP"
+    S_IXGRP: i32 = "S_IXGRP"
+    S_IROTH: i32 = "S_IROTH"
+    S_IWOTH: i32 = "S_IWOTH"
+    S_IXOTH: i32 = "S_IXOTH"
+    S_IFMT: u64 = "S_IFMT"
+    S_IFREG: u64 = "S_IFREG"
+    S_IFDIR: u64 = "S_IFDIR"
+    S_IFLNK: u64 = "S_IFLNK"
+
+// What `access` asks about.
+c const
+    F_OK: i32 = "F_OK"
+    R_OK: i32 = "R_OK"
+    W_OK: i32 = "W_OK"
+    X_OK: i32 = "X_OK"
+
+// ## Signals
+//
+// The numbers are the platform's. **`SIGKILL` and `SIGSTOP` cannot be caught** -- `start` on either
+// answers `EINVAL`, which is the kernel's rule and not libuv's.
+
+c const
+    SIGHUP: i32 = "SIGHUP"
+    SIGINT: i32 = "SIGINT"
+    SIGQUIT: i32 = "SIGQUIT"
+    SIGABRT: i32 = "SIGABRT"
+    SIGKILL: i32 = "SIGKILL"
+    SIGPIPE: i32 = "SIGPIPE"
+    SIGALRM: i32 = "SIGALRM"
+    SIGTERM: i32 = "SIGTERM"
+    SIGCHLD: i32 = "SIGCHLD"
+    SIGCONT: i32 = "SIGCONT"
+    SIGSTOP: i32 = "SIGSTOP"
+    SIGTSTP: i32 = "SIGTSTP"
+    SIGUSR1: i32 = "SIGUSR1"
+    SIGUSR2: i32 = "SIGUSR2"
+    SIGWINCH: i32 = "SIGWINCH"
+
+// ## Addresses
+
+c const
+    AF_UNSPEC: i32 = "AF_UNSPEC"
+    AF_INET: i32 = "AF_INET"
+    AF_INET6: i32 = "AF_INET6"
+
+    SOCK_STREAM: i32 = "SOCK_STREAM"
+    SOCK_DGRAM: i32 = "SOCK_DGRAM"
+
+    AI_PASSIVE: i32 = "AI_PASSIVE"
+    AI_CANONNAME: i32 = "AI_CANONNAME"
+    AI_NUMERICHOST: i32 = "AI_NUMERICHOST"
+    AI_NUMERICSERV: i32 = "AI_NUMERICSERV"
+    AI_ADDRCONFIG: i32 = "AI_ADDRCONFIG"
+
+// Bind to the v6 address only, rather than to the v4-mapped range as well. The one flag `bind`
+// takes.
+c const
+    TCP_IPV6ONLY: u32 = "UV_TCP_IPV6ONLY"
+
+// ## Terminals
+
+c const
+    TTY_MODE_NORMAL: i32 = "UV_TTY_MODE_NORMAL"
+    TTY_MODE_RAW: i32 = "UV_TTY_MODE_RAW"
+    TTY_MODE_IO: i32 = "UV_TTY_MODE_IO"
+
+// ## What a descriptor turns out to be
+//
+// `guess_handle` answers with one of these, which is how a program decides whether its standard
+// input is a terminal, a pipe or a file.
+
+c const
+    UNKNOWN_HANDLE: i32 = "UV_UNKNOWN_HANDLE"
+    HANDLE_TCP: i32 = "UV_TCP"
+    HANDLE_NAMED_PIPE: i32 = "UV_NAMED_PIPE"
+    HANDLE_TTY: i32 = "UV_TTY"
+    HANDLE_UDP: i32 = "UV_UDP"
+    HANDLE_FILE: i32 = "UV_FILE"
+    HANDLE_TIMER: i32 = "UV_TIMER"
+    HANDLE_IDLE: i32 = "UV_IDLE"
+    HANDLE_PREPARE: i32 = "UV_PREPARE"
+    HANDLE_CHECK: i32 = "UV_CHECK"
+    HANDLE_ASYNC: i32 = "UV_ASYNC"
+    HANDLE_SIGNAL: i32 = "UV_SIGNAL"
+    HANDLE_PROCESS: i32 = "UV_PROCESS"
+
+// And what a request turns out to be, which is what `req_size` is asked about.
+c const
+    REQ_WRITE: i32 = "UV_WRITE"
+    REQ_CONNECT: i32 = "UV_CONNECT"
+    REQ_SHUTDOWN: i32 = "UV_SHUTDOWN"
+    REQ_FS: i32 = "UV_FS"
+    REQ_GETADDRINFO: i32 = "UV_GETADDRINFO"
+
+// ## Child processes
+
+c const
+    PROCESS_SETUID: u32 = "UV_PROCESS_SETUID"
+    PROCESS_SETGID: u32 = "UV_PROCESS_SETGID"
+    PROCESS_DETACHED: u32 = "UV_PROCESS_DETACHED"
+
+// What one of the child's three descriptors is wired to.
+c const
+    IGNORE: i32 = "UV_IGNORE"
+    CREATE_PIPE: i32 = "UV_CREATE_PIPE"
+    INHERIT_FD: i32 = "UV_INHERIT_FD"
+    INHERIT_STREAM: i32 = "UV_INHERIT_STREAM"
+    READABLE_PIPE: i32 = "UV_READABLE_PIPE"
+    WRITABLE_PIPE: i32 = "UV_WRITABLE_PIPE"
+    NONBLOCK_PIPE: i32 = "UV_NONBLOCK_PIPE"
+
+// ## Directory entries
+
+c const
+    DIRENT_UNKNOWN: i32 = "UV_DIRENT_UNKNOWN"
+    DIRENT_FILE: i32 = "UV_DIRENT_FILE"
+    DIRENT_DIR: i32 = "UV_DIRENT_DIR"
+    DIRENT_LINK: i32 = "UV_DIRENT_LINK"
+    DIRENT_FIFO: i32 = "UV_DIRENT_FIFO"
+    DIRENT_SOCKET: i32 = "UV_DIRENT_SOCKET"
+    DIRENT_CHAR: i32 = "UV_DIRENT_CHAR"
+    DIRENT_BLOCK: i32 = "UV_DIRENT_BLOCK"
+
+// ## Clocks
+
+c const
+    CLOCK_MONOTONIC: i32 = "UV_CLOCK_MONOTONIC"
+    CLOCK_REALTIME: i32 = "UV_CLOCK_REALTIME"
