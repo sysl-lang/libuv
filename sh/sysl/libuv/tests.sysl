@@ -534,6 +534,170 @@ async_stat_missing()
     lp.run().expect("the loop ran")
     assert_eq(state.code, ENOENT)
 
+// -- Watchers, wake-ups and signals ---------------------------------------------------------------
+
+@test("an idle watcher is called every turn and stops when told")
+idle_turns()
+    val lp = default_loop()
+    val i = idle(lp).expect("an idle watcher")
+    val n: &Counter = Counter(0)
+
+    i.start(() ->
+        n.bump()
+        if n.value == 5 then i.close())
+
+    lp.run().expect("the loop ran")
+    assert_eq(n.value, 5)
+
+@test("prepare runs before the block and check runs after it")
+prepare_and_check()
+    val lp = default_loop()
+    val p = prepare(lp).expect("a prepare watcher")
+    val k = check(lp).expect("a check watcher")
+    val order: &Sink = Sink(buf())
+
+    p.start(() -> order.add([112]))
+    k.start(() ->
+        order.add([107])
+        p.close()
+        k.close())
+
+    // Something has to make the loop turn at all, since two watchers with nothing to wait for
+    // would spin: a one-shot timer gives it exactly one turn's worth of work.
+    val t = timer(lp).expect("a timer")
+
+    t.start(1, 0, () -> t.close())
+    lp.run().expect("the loop ran")
+
+    assert_eq(order.bytes.len(), 2)
+    assert_eq(order.bytes[0], 112)
+    assert_eq(order.bytes[1], 107)
+
+@test("a notifier runs its callback when it is sent to")
+notifier_wakes_the_loop()
+    val lp = default_loop()
+    val n: &Counter = Counter(0)
+    val wake = notifier(() -> n.bump(), lp).expect("a notifier")
+
+    wake.send().expect("sent")
+    assert_eq(n.value, 0)
+
+    lp.run(RUN_ONCE).expect("the loop turned")
+    assert_eq(n.value, 1)
+
+    wake.close()
+    lp.run().expect("the loop ran")
+
+@test("a signal sent to this process arrives as a callback")
+signal_arrives()
+    val lp = default_loop()
+    val s = signal(lp).expect("a signal watcher")
+    val seen: &Held = Held(0)
+
+    s.start(SIGUSR1, (signum) ->
+        seen.code = signum
+        s.close()).expect("watching")
+
+    assert_eq(s.watching(), SIGUSR1)
+
+    kill(pid(), SIGUSR1).expect("sent")
+    lp.run().expect("the loop ran")
+
+    assert_eq(seen.code, SIGUSR1)
+
+@test("the two signals that cannot be caught say so rather than pretending")
+uncatchable()
+    val s = signal().expect("a signal watcher")
+
+    assert(s.start(SIGKILL, ignore_signal).is_err(), "SIGKILL cannot be caught")
+    assert(s.start(SIGSTOP, ignore_signal).is_err(), "and neither can SIGSTOP")
+
+    s.close()
+    default_loop().run().expect("the loop ran")
+
+private ignore_signal(signum: i32) -> unit = ()
+
+// -- Child processes ------------------------------------------------------------------------------
+
+// The whole of `spawn` in one test: a program found on `PATH`, arguments that do not include its
+// own name, its output read through a pipe, and an exit status delivered to the loop.
+@test("a child runs, writes to the pipe it was given, and is reaped by the loop")
+child_process()
+    val lp = default_loop()
+    val out = pipe(false, lp).expect("a pipe")
+    val got: &Sink = Sink(buf())
+    val ended: &Held = Held(-1)
+
+    val child = spawn("echo", ["hello"], ignore_exit_status,
+                      [Ignore, ToPipe(out, WRITABLE_PIPE), Inherit], "", [], 0,
+                      lp).expect("the child started")
+
+    // The exit callback is set after the fact, because it wants the handle -- and nothing can have
+    // happened in between, since a callback only fires on a turn of the loop.
+    child.on_exit((status, signal) ->
+        ended.code = i32(status)
+        child.close())
+
+    out.read_start((r) -> r match
+        Data(bytes) -> got.add(bytes)
+        End -> out.close()
+        Failed(_) -> out.close())
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(ended.code, 0)
+    assert_eq(got.bytes.len(), 6)
+    assert_eq(got.bytes[0], 104)
+    assert_eq(got.bytes[5], 10)
+
+@test("a program that is not there is refused at the call rather than in the callback")
+no_such_program()
+    val lp = default_loop()
+    val r = spawn("no-such-program-anywhere", [], ignore_exit_status, [], "", [], 0, lp)
+
+    assert(r.is_err(), "there is no such program")
+    assert_eq(r.unwrap_err(), Error(ENOENT))
+
+private ignore_exit_status(status: i64, signal: i32) -> unit = ()
+
+// -- The machine ----------------------------------------------------------------------------------
+
+@test("libuv reports its own version, and it is the one the headers came from")
+reports_its_version()
+    val v = version()
+
+    assert(v >> 16 == 1, "libuv 1.x")
+    assert(version_string().len > 0, "and it has a name for itself")
+
+@test("the monotonic clock only ever moves forward")
+monotonic()
+    val a = hrtime()
+
+    sleep(2)
+
+    val b = hrtime()
+
+    assert(b > a, "time passed")
+    assert(b - a >= 1000000, "and it was at least the millisecond that was asked for")
+
+@test("the machine answers for itself")
+machine_facts()
+    assert(available_parallelism() >= 1, "at least one thread is useful")
+    assert(total_memory() > 0, "the machine has memory")
+    assert(uptime().expect("uptime") > 0.0, "and has been up for a while")
+    assert(hostname().expect("a hostname").len > 0, "and has a name")
+    assert(cwd().expect("a directory").len > 0, "and this program is somewhere")
+    assert_eq(pid(), pid())
+    assert(parent_pid() != pid(), "and something started it")
+
+@test("an environment variable set is a variable read back, and unset is gone")
+environment()
+    set_env("SYSL_LIBUV_TEST", "yes").expect("set")
+    assert_eq(env("SYSL_LIBUV_TEST").expect("read"), "yes")
+
+    unset_env("SYSL_LIBUV_TEST").expect("unset")
+    assert(env("SYSL_LIBUV_TEST").is_err(), "and it is gone")
+
 // The directory a path is in, which is only ever a temporary one made three lines earlier here.
 private dir_of(path: string) -> string = path[0..<path.len - 5]
 

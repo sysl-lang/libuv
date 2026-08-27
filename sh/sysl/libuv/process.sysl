@@ -1,0 +1,207 @@
+// Child processes, started and reaped by the loop.
+//
+//     val child = spawn("ls", ["-l", "/tmp"], (status, signal) ->
+//         print(s"exited with ${str(status)}")
+//         child.close())?
+//
+//     lp.run()?
+//
+// **`args` does not carry the program's own name.** libuv, like `execvp`, wants it as the first
+// element; this puts it there, so what a caller writes is the arguments and nothing else.
+//
+// **The child is reaped by the loop**, which is what `SIGCHLD` handling would otherwise be for. The
+// exit callback runs once, with the status and the signal that ended it -- one of the two is always
+// zero.
+//
+// **A process handle is a handle**, so it has to be closed like any other, and a program that
+// forgets is a program whose loop never returns.
+//
+// ## Wiring up the child's descriptors
+//
+// `stdio` says what the child's first three descriptors are. The default is `Inherit` for all
+// three, which is what a shell does. `ToPipe` is how a parent reads what the child wrote:
+//
+//     val out = pipe()?
+//
+//     spawn("date", [], on_exit, [Ignore, ToPipe(out, WRITABLE_PIPE), Inherit])?
+//     out.read_start((r) -> ...)
+//
+// **The flag is written from the CHILD's point of view**, which is libuv's convention and is the
+// one thing about this that is easy to get backwards: a pipe the parent *reads* is one the child
+// *writes*, so it is `WRITABLE_PIPE`.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_mut_ptr
+import sysl.text.{CString, cstring}
+
+/** What one of the child's descriptors is. */
+enum Stdio
+    /** The child gets nothing there -- a read returns end of file and a write goes nowhere. */
+    Ignore
+
+    /** The child gets this process's own descriptor, so its output lands wherever ours does. */
+    Inherit
+
+    /** The child gets a descriptor this process already has, under the same number. */
+    InheritFd(fd: i32)
+
+    /** The child gets one end of a pipe and this process keeps the other.
+     *
+     * `flags` is `READABLE_PIPE`, `WRITABLE_PIPE`, or both -- **from the child's point of view**,
+     * so a pipe the parent reads is `WRITABLE_PIPE`.
+     */
+    ToPipe(p: &Pipe, flags: i32)
+
+/** A child process. */
+struct Process
+    private storage: [c.PROCESS_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Process]
+    private exited: &Fn(i64, i32) -> unit
+    private on_closed: &Fn() -> unit
+
+    // The argument and environment strings, and the two NUL-terminated arrays of pointers into
+    // them. libuv reads all of it during `spawn` and the fork copies what the child needs, so
+    // strictly this could go when `spawn` returns -- it is kept because the cost is nothing and the
+    // rule "the handle owns what libuv was shown" needs no exceptions.
+    private strings: Buf[CString]
+    private argv: []*u8
+    private envp: []*u8
+    private stdio: []u64
+
+    private raw(*self) -> *c.Process = ptr_cast(&self.storage[0])
+
+    /** The loop this child is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** The child's process id. */
+    pid(*self) -> i32 = c.process_get_pid(self.raw())
+
+    /** Send the child a signal. `SIGTERM` asks it to stop and `SIGKILL` does not ask. */
+    kill(*self, signum: i32) -> Result[unit, Error] =
+        checked(c.process_kill(self.raw(), signum))
+
+    /** Replace the exit callback.
+     *
+     * **This is what a callback that needs the handle uses**, since `spawn` takes its callback
+     * before there is a handle to capture. Nothing can have run in between: a callback only fires
+     * on a turn of the loop, and `spawn` returns before the loop turns.
+     *
+     *     val child = spawn("sleep", ["1"], ignore, ...)?
+     *
+     *     child.on_exit((status, signal) -> child.close())
+     */
+    on_exit(*self, cb: &Fn(i64, i32) -> unit) = self.exited = cb
+end Process
+
+impl Handle for Process
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.exited = ignore_exit
+        self.on_closed = noop
+        self.strings = buf()
+        self.argv = [null; 0]
+        self.envp = [null; 0]
+        self.stdio = [0; 0]
+        self.me = None
+
+        cb()
+
+private ignore_exit(status: i64, signal: i32) -> unit = ()
+
+private process_exited(h: *c.Process, status: i64, signal: i32) -> unit
+    val p: *Process = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    p.exited(status, signal)
+
+/** Start `file` with `args`, and call `cb` when it exits.
+ *
+ * `file` is looked up on `PATH` unless it has a slash in it, which is `execvp`'s rule. `ENOENT` is
+ * what a program that is not there answers with, reported from this call rather than from the
+ * callback.
+ *
+ * `cwd` of `""` means the child starts where this process is. `env` of an empty list means it
+ * inherits this process's environment; anything else replaces it entirely, and each entry is
+ * `"NAME=value"`.
+ *
+ * `flags` takes `PROCESS_DETACHED`, which lets the child outlive this process -- and note that it
+ * still keeps the loop alive until the handle is `unref`ed.
+ */
+spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []const Stdio = [],
+      cwd: string = "", env: []const string = [], flags: u32 = 0,
+      lp: &Loop = default_loop()) -> Result[&Process, Error]
+    val count = if stdio.len == 0 then 3 else stdio.len
+
+    var p: &Process = Process([0; c.PROCESS_WORDS], lp, None, cb, noop, buf(), [null; 0], [null; 0],
+                              [0; count * c.STDIO_WORDS])
+
+    // argv, with the program's own name where `execvp` looks for it, and a null to end it.
+    p.strings.push(cstring(file))
+
+    for a in args do p.strings.push(cstring(a))
+
+    var argv: []*u8 = [null; p.strings.len() + 1]
+
+    for i in 0..<p.strings.len() do argv[i] = p.strings.at(i).ptr
+
+    p.argv = argv
+
+    // The environment, if it is being replaced. An empty list leaves the pointer null, which is
+    // what libuv reads as "inherit".
+    if env.len > 0
+        val first = p.strings.len()
+
+        for e in env do p.strings.push(cstring(e))
+
+        var envp: []*u8 = [null; env.len + 1]
+
+        for i in 0..<env.len do envp[i] = p.strings.at(first + i).ptr
+
+        p.envp = envp
+
+    val dir = cstring(cwd)
+    val containers: *c.StdioContainer = ptr_cast(as_mut_ptr(p.stdio))
+
+    if stdio.len == 0
+        for i in 0..<3 do c.stdio_set_fd(containers, i32(i), INHERIT_FD, i32(i))
+    else
+        var i: usize = 0
+
+        for s in stdio
+            s match
+                Ignore -> c.stdio_set_fd(containers, i32(i), IGNORE, 0)
+                Inherit -> c.stdio_set_fd(containers, i32(i), INHERIT_FD, i32(i))
+                InheritFd(fd) -> c.stdio_set_fd(containers, i32(i), INHERIT_FD, fd)
+                ToPipe(pipe, f) -> c.stdio_set_stream(containers, i32(i), CREATE_PIPE | f,
+                                                      pipe.stream_ptr())
+
+            i += 1
+
+    var options = c.ProcessOptions(&process_exited, p.strings.at(0).ptr, as_mut_ptr(p.argv),
+                                   as_mut_ptr(p.envp), if cwd == "" then null else dir.ptr, flags,
+                                   i32(count), containers, 0, 0)
+
+    p.me = Some(p)
+    c.handle_set_data(p.handle_ptr(), ptr_cast(&*p))
+
+    val r = c.spawn(lp.raw(), p.raw(), &options)
+
+    if r < 0
+        p.me = None
+        return Err(Error(r))
+
+    Ok(p)
+
+/** Stop the child processes this program starts from inheriting its descriptors, from this point
+ * on. What a program calls at startup when it is going to spawn things and does not want them
+ * holding its sockets open.
+ */
+disable_stdio_inheritance() = c.disable_stdio_inheritance()

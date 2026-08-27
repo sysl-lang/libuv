@@ -1,0 +1,194 @@
+// What libuv knows about the machine and the process, which is a portable answer to a pile of
+// questions each platform answers its own way.
+//
+//     print(version_string())                 // "1.52.1"
+//     print(hostname()?)
+//     print(available_parallelism())          // what a thread pool should be sized to
+//
+// None of this needs a loop and none of it blocks for long enough to matter, so all of it is
+// ordinary blocking code.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.text.cstring
+import sysl.text.from_cstring
+
+/** The version of libuv this program is linked against, as `"1.52.1"`. */
+version_string() -> string = from_cstring(c.version_string()).unwrap_or("")
+
+/** The same, packed as `major << 16 | minor << 8 | patch`, for comparing against a floor. */
+version() -> u32 = c.version()
+
+/** A monotonic clock in nanoseconds, from an arbitrary point in the past.
+ *
+ * **This is the one to measure with.** It never goes backwards and is not affected by the system
+ * clock being set, which is what makes a difference between two readings meaningful.
+ */
+hrtime() -> u64 = c.hrtime()
+
+/** Block this thread for `msec` milliseconds. On the loop's thread that blocks the loop, which is
+ * almost never what is wanted -- a `Timer` is.
+ */
+sleep(msec: u32) = c.sleep_msec(msec)
+
+/** The wall clock: seconds since the epoch, and microseconds within the second.
+ *
+ * Unlike `hrtime` this can jump, because somebody or something can set it. It is what to record a
+ * time *as* and not what to measure *with*.
+ */
+time_of_day() -> Result[(i64, i32), Error]
+    var tv = c.Timeval64(0, 0)
+    val r = c.gettimeofday(&tv)
+
+    if r < 0 then Err(Error(r)) else Ok((tv.tv_sec, tv.tv_usec))
+
+/** A clock by name -- `CLOCK_MONOTONIC` or `CLOCK_REALTIME` -- in seconds and nanoseconds. */
+clock(id: i32 = CLOCK_MONOTONIC) -> Result[(i64, i32), Error]
+    var ts = c.Timespec64(0, 0)
+    val r = c.clock_gettime(id, &ts)
+
+    if r < 0 then Err(Error(r)) else Ok((ts.tv_sec, ts.tv_nsec))
+
+/** How long the machine has been up, in seconds. */
+uptime() -> Result[f64, Error]
+    var seconds: f64 = 0.0
+    val r = c.uptime(&seconds)
+
+    if r < 0 then Err(Error(r)) else Ok(seconds)
+
+/** The one, five and fifteen minute load averages. All three are `0.0` where the platform has no
+ * such notion.
+ */
+loadavg() -> (f64, f64, f64)
+    var avg: [3]f64 = [0.0, 0.0, 0.0]
+
+    c.loadavg(&avg[0])
+    (avg[0], avg[1], avg[2])
+
+/** How much memory this process has resident, in bytes. */
+resident_memory() -> Result[usize, Error]
+    var rss: usize = 0
+    val r = c.resident_set_memory(&rss)
+
+    if r < 0 then Err(Error(r)) else Ok(rss)
+
+/** Memory the machine has free, in bytes. */
+free_memory() -> u64 = c.get_free_memory()
+
+/** Memory the machine has at all, in bytes. */
+total_memory() -> u64 = c.get_total_memory()
+
+/** What this process is actually allowed, which is the cgroup's limit in a container and `0` where
+ * there is no limit. **This is the number a program in a container should size its caches by**, and
+ * `total_memory` is the one that misleads there.
+ */
+constrained_memory() -> u64 = c.get_constrained_memory()
+
+/** How much of the constraint is left, in bytes. */
+available_memory() -> u64 = c.get_available_memory()
+
+/** How many threads this process can usefully run at once.
+ *
+ * It is the CPU count narrowed by whatever affinity mask and container quota apply, which is why it
+ * is worth asking libuv rather than counting cores.
+ */
+available_parallelism() -> u32 = c.available_parallelism()
+
+/** This process's id. */
+pid() -> i32 = c.os_getpid()
+
+/** The id of whatever started this process. */
+parent_pid() -> i32 = c.os_getppid()
+
+/** A process's scheduling priority, where lower is more favourable. */
+priority(of_pid: i32 = 0) -> Result[i32, Error]
+    var value: i32 = 0
+    val r = c.os_getpriority(of_pid, &value)
+
+    if r < 0 then Err(Error(r)) else Ok(value)
+
+/** Change a process's priority. Lowering it below zero needs privileges on most platforms. */
+set_priority(value: i32, of_pid: i32 = 0) -> Result[unit, Error] =
+    checked(c.os_setpriority(of_pid, value))
+
+/** The current working directory, with no trailing separator. */
+cwd() -> Result[string, Error]
+    var buf: [1024]u8 = [0; 1024]
+    var size: usize = 1024
+    val r = c.cwd(&buf[0], &size)
+
+    if r < 0 then Err(Error(r)) else Ok(from_cstring(&buf[0]).unwrap_or(""))
+
+/** Change the current working directory. */
+chdir(dir: string) -> Result[unit, Error]
+    val d = cstring(dir)
+
+    checked(c.chdir(d.ptr))
+
+/** The path of this program's own executable, with links resolved. What a program uses to find the
+ * files installed beside it.
+ */
+exepath() -> Result[string, Error]
+    var buf: [1024]u8 = [0; 1024]
+    var size: usize = 1024
+    val r = c.exepath(&buf[0], &size)
+
+    if r < 0 then Err(Error(r)) else Ok(from_cstring(&buf[0]).unwrap_or(""))
+
+/** The user's home directory: `HOME` where it is set, and the password database otherwise. */
+homedir() -> Result[string, Error]
+    var buf: [1024]u8 = [0; 1024]
+    var size: usize = 1024
+    val r = c.os_homedir(&buf[0], &size)
+
+    if r < 0 then Err(Error(r)) else Ok(from_cstring(&buf[0]).unwrap_or(""))
+
+/** Where temporary files go: `TMPDIR` and its relatives where set, `/tmp` otherwise. */
+tmpdir() -> Result[string, Error]
+    var buf: [1024]u8 = [0; 1024]
+    var size: usize = 1024
+    val r = c.os_tmpdir(&buf[0], &size)
+
+    if r < 0 then Err(Error(r)) else Ok(from_cstring(&buf[0]).unwrap_or(""))
+
+/** This machine's name. */
+hostname() -> Result[string, Error]
+    var buf: [1024]u8 = [0; 1024]
+    var size: usize = 1024
+    val r = c.os_gethostname(&buf[0], &size)
+
+    if r < 0 then Err(Error(r)) else Ok(from_cstring(&buf[0]).unwrap_or(""))
+
+// **1024 is past `PATH_MAX` on every platform this builds for**, so `ENOBUFS` -- which is what libuv
+// answers when the buffer is short, having written the length it needed into `size` -- is not a case
+// the five calls above can reach. A binding that had to grow would read `size` and call again.
+
+/** An environment variable, or `ENOENT` where it is not set.
+ *
+ * **This reads the process's environment rather than a copy**, so it sees what `set_env` did and
+ * what a library did behind your back.
+ */
+env(name: string) -> Result[string, Error]
+    val n = cstring(name)
+
+    var buf: [4096]u8 = [0; 4096]
+    var size: usize = 4096
+    val r = c.os_getenv(n.ptr, &buf[0], &size)
+
+    if r < 0 then return Err(Error(r))
+
+    Ok(from_cstring(&buf[0]).unwrap_or(""))
+
+/** Set an environment variable for this process and everything it starts from now on. */
+set_env(name: string, value: string) -> Result[unit, Error]
+    val n = cstring(name)
+    val v = cstring(value)
+
+    checked(c.os_setenv(n.ptr, v.ptr))
+
+/** Remove an environment variable. */
+unset_env(name: string) -> Result[unit, Error]
+    val n = cstring(name)
+
+    checked(c.os_unsetenv(n.ptr))
