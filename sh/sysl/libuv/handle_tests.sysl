@@ -1,0 +1,368 @@
+module sh.sysl.libuv
+@tests
+
+// What every handle can do, and the parts of a timer, a watcher and a signal that the end-to-end
+// cases in `tests.sysl` do not reach.
+//
+// **Everything here closes what it opened**, which is not tidiness: a handle left open keeps the
+// default loop alive, and the next test in the file would then never see `run` return.
+
+import sysl.buf.{Buf, buf}
+
+private struct Tally
+    n: int
+    marks: Buf[u8]
+
+    bump(*self) = self.n += 1
+
+    mark(*self, b: u8) = self.marks.push(b)
+
+private tally() -> &Tally = Tally(0, buf())
+
+// -- Timers -------------------------------------------------------------------------------------
+
+@test("a timer that is stopped does not fire, and keeps its callback for later")
+timer_stop_and_again()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+    val n = tally()
+
+    // It stops itself on each of the first two calls, because `again` below restarts it and the
+    // second run would otherwise never end.
+    t.start(1, 5, () ->
+        n.bump()
+        t.stop().expect("stopped")).expect("started")
+
+    assert(t.is_active(), "a started timer is active")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(n.n, 1)
+    assert(!t.is_active(), "and a stopped one is not")
+
+    // `again` restarts it with the repeat it was given, and the callback it kept is called again.
+    t.again().expect("restarted")
+    assert(t.is_active(), "again makes it active")
+
+    lp.run().expect("the loop ran")
+    assert_eq(n.n, 2)
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+// libuv's `uv_timer_again` refuses a timer it has never seen a callback for and refuses nothing
+// else: on a one-shot it does nothing and answers success. Both halves are pinned here, because the
+// obvious reading -- that a timer with no interval has nothing to restart with, so it fails -- is
+// what this package's own documentation said until this test was written.
+@test("again refuses a timer that was never started, and quietly does nothing to a one-shot")
+again_only_refuses_a_timer_never_started()
+    val lp = default_loop()
+    val fresh = timer(lp).expect("a timer")
+
+    assert_eq(fresh.again().unwrap_err(), Error(EINVAL))
+
+    val once = timer(lp).expect("a timer")
+
+    once.start(60000, 0, noop).expect("started")
+    once.stop().expect("stopped")
+
+    assert(once.again().is_ok(), "a one-shot answers success")
+    assert(!once.is_active(), "and is still stopped, because there was no interval to restart with")
+
+    fresh.close()
+    once.close()
+    lp.run().expect("the loop ran")
+
+@test("the repeat is read back, and setting it takes effect after the next callback")
+timer_repeat()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+    val n = tally()
+
+    t.start(1, 5, () ->
+        n.bump()
+
+        if n.n == 1
+            // Set while it is scheduled: the interval changes for the calls after this one, which
+            // is what `set_repeat` promises and `again` is the way around.
+            t.set_repeat(500)
+            assert_eq(t.repeat(), 500)
+        else
+            t.close()).expect("started")
+
+    assert_eq(t.repeat(), 5)
+
+    lp.run().expect("the loop ran")
+    assert_eq(n.n, 2)
+
+@test("due_in counts down while a timer is waiting, and outlives the stop that ends the wait")
+timer_due_in()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+
+    assert_eq(t.due_in(), 0)
+
+    t.start(60000, 0, noop).expect("started")
+
+    // Read against the loop's cached clock, so it is what the loop would wait for.
+    assert(t.due_in() > 0, "it is waiting for something")
+    assert(t.due_in() <= 60000, "and no longer than it was asked to")
+
+    // **libuv reads the deadline without asking whether the timer is running**, so a stopped timer
+    // still reports one. `is_active` is what separates the two, and a binding that documented
+    // `due_in` as zero for a stopped timer -- as this one did -- would be wrong.
+    t.stop().expect("stopped")
+
+    assert(t.due_in() > 0, "the deadline is still there")
+    assert(!t.is_active(), "and the timer is not")
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+@test("every handle knows the loop it is on")
+handles_know_their_loop()
+    val mine = new_loop().expect("a loop")
+    val t = timer(mine).expect("a timer")
+    val i = idle(mine).expect("an idle watcher")
+    val p = prepare(mine).expect("a prepare watcher")
+    val k = check(mine).expect("a check watcher")
+    val s = signal(mine).expect("a signal watcher")
+    val a = notifier(noop, mine).expect("a notifier")
+    val sock = tcp(mine).expect("a socket")
+    val pp = pipe(false, mine).expect("a pipe")
+
+    assert(t.on_loop().alive() == mine.alive(), "the timer's loop is the one it was made on")
+    assert_eq(i.on_loop().backend_fd(), mine.backend_fd())
+    assert_eq(p.on_loop().backend_fd(), mine.backend_fd())
+    assert_eq(k.on_loop().backend_fd(), mine.backend_fd())
+    assert_eq(s.on_loop().backend_fd(), mine.backend_fd())
+    assert_eq(a.on_loop().backend_fd(), mine.backend_fd())
+    assert_eq(sock.on_loop().backend_fd(), mine.backend_fd())
+    assert_eq(pp.on_loop().backend_fd(), mine.backend_fd())
+
+    t.close()
+    i.close()
+    p.close()
+    k.close()
+    s.close()
+    a.close()
+    sock.close()
+    pp.close()
+
+    mine.run().expect("the loop ran")
+    mine.close().expect("closed")
+
+// -- Watchers -----------------------------------------------------------------------------------
+
+@test("an idle watcher that is stopped stops spinning the loop")
+idle_stop()
+    val lp = default_loop()
+    val i = idle(lp).expect("an idle watcher")
+    val n = tally()
+
+    i.start(() ->
+        n.bump()
+
+        if n.n == 3 then i.stop().expect("stopped")).expect("started")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(n.n, 3)
+    assert(!i.is_active(), "and it is no longer active")
+
+    i.close()
+    lp.run().expect("the loop ran")
+
+@test("a prepare and a check watcher each stop when told")
+prepare_check_stop()
+    val lp = default_loop()
+    val p = prepare(lp).expect("a prepare watcher")
+    val k = check(lp).expect("a check watcher")
+    val n = tally()
+    val t = timer(lp).expect("a timer")
+
+    p.start(() ->
+        n.mark(112)
+        p.stop().expect("stopped")).expect("started")
+
+    k.start(() ->
+        n.mark(107)
+        k.stop().expect("stopped")).expect("started")
+
+    t.start(1, 0, () -> t.close()).expect("started")
+    lp.run().expect("the loop ran")
+
+    assert_eq(n.marks.len(), 2)
+    assert(!p.is_active(), "the prepare watcher stopped")
+    assert(!k.is_active(), "and so did the check watcher")
+
+    p.close()
+    k.close()
+    lp.run().expect("the loop ran")
+
+// -- Signals ------------------------------------------------------------------------------------
+
+@test("a one-shot signal watcher stops itself after the first arrival")
+signal_once()
+    val lp = default_loop()
+    val s = signal(lp).expect("a signal watcher")
+    val n = tally()
+
+    s.start_once(SIGUSR2, (signum) -> n.bump()).expect("watching")
+    assert_eq(s.watching(), SIGUSR2)
+
+    kill(pid(), SIGUSR2).expect("sent")
+    lp.run().expect("the loop ran")
+
+    assert_eq(n.n, 1)
+    assert(!s.is_active(), "a one-shot is not active once it has fired")
+
+    s.close()
+    lp.run().expect("the loop ran")
+
+@test("a stopped signal watcher stops watching, and says it watches nothing")
+signal_stop()
+    val lp = default_loop()
+    val s = signal(lp).expect("a signal watcher")
+    val n = tally()
+
+    s.start(SIGUSR2, (signum) -> n.bump()).expect("watching")
+    s.stop().expect("stopped")
+
+    assert_eq(s.watching(), 0)
+    assert(!s.is_active(), "and it is not active")
+
+    // The default disposition for SIGUSR2 would end the process, so nothing is sent here: what is
+    // being checked is that the watcher is no longer one, and `run` returning at all is that.
+    assert(!lp.run().unwrap(), "with nothing watching, the loop has nothing to wait for")
+    assert_eq(n.n, 0)
+
+    s.close()
+    lp.run().expect("the loop ran")
+
+// -- The reference count --------------------------------------------------------------------------
+
+@test("has_ref follows unref and keep")
+reference_counting()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+
+    assert(t.has_ref(), "a new handle counts")
+
+    t.unref()
+    assert(!t.has_ref(), "and does not after unref")
+
+    t.keep()
+    assert(t.has_ref(), "and does again after keep")
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+// -- Descriptors and buffers ----------------------------------------------------------------------
+
+@test("fileno answers for a handle that has a descriptor and refuses one that does not")
+handle_fileno()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+
+    assert(t.fileno().is_err(), "a timer is not anything the kernel has a descriptor for")
+
+    val sock = tcp(lp).expect("a socket")
+
+    sock.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+
+    val fd = sock.fileno().expect("a descriptor")
+
+    assert(fd >= 0, "a bound socket has one")
+    assert_eq(guess_handle(fd), HANDLE_TCP)
+
+    t.close()
+    sock.close()
+    lp.run().expect("the loop ran")
+
+@test("the kernel's socket buffers are read and set")
+socket_buffers()
+    val lp = default_loop()
+    val sock = tcp(lp).expect("a socket")
+
+    sock.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+
+    val out = sock.send_buffer_size().expect("read")
+    val into = sock.recv_buffer_size().expect("read")
+
+    assert(out > 0, "the kernel has a send buffer")
+    assert(into > 0, "and a receive buffer")
+
+    // Setting is a request rather than an instruction -- the kernel may round it or refuse to
+    // shrink it -- so what is checked is that it is accepted and reads back as something sane.
+    sock.send_buffer_size(out).expect("set")
+    assert(sock.send_buffer_size().expect("read") > 0, "and it still has one")
+
+    sock.close()
+    lp.run().expect("the loop ran")
+
+// -- The loop -------------------------------------------------------------------------------------
+
+@test("stop makes run return with work still outstanding")
+loop_stop()
+    val lp = default_loop()
+    val t = timer(lp).expect("a timer")
+    val n = tally()
+
+    t.start(0, 1, () ->
+        n.bump()
+
+        if n.n == 2 then lp.stop()).expect("started")
+
+    assert(lp.run().unwrap(), "run returned with the timer still open")
+    assert_eq(n.n, 2)
+    assert(t.is_active(), "and the timer was not stopped, only left")
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+@test("the backend descriptor and timeout are what an embedder polls on")
+loop_backend()
+    val lp = default_loop()
+
+    assert(lp.backend_fd() >= 0, "there is something to wait on")
+    assert_eq(lp.backend_timeout(), 0)
+
+    val t = timer(lp).expect("a timer")
+
+    t.start(60000, 0, noop).expect("started")
+    lp.run(RUN_NOWAIT).expect("the loop turned")
+
+    val wait = lp.backend_timeout()
+
+    assert(wait > 0, "with a timer pending, the loop would sleep")
+    assert(wait <= 60000, "and no longer than the timer asked for")
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+// **A loop nobody asked to measure answers zero forever**, which is worth a test of its own: the
+// number looks like a working measurement of a loop that never slept, and there is nothing in the
+// answer to tell the two apart.
+@test("idle time is zero until the loop is asked to measure it, and moves after that")
+loop_idle_time()
+    val unmeasured = new_loop().expect("a loop")
+    val t = timer(unmeasured).expect("a timer")
+
+    t.start(5, 0, () -> t.close()).expect("started")
+    unmeasured.run().expect("the loop ran")
+
+    assert_eq(unmeasured.idle_time(), 0)
+    unmeasured.close().expect("closed")
+
+    val measured = new_loop().expect("a loop")
+
+    measured.configure(METRICS_IDLE_TIME).expect("measuring")
+
+    val t2 = timer(measured).expect("a timer")
+
+    t2.start(5, 0, () -> t2.close()).expect("started")
+    measured.run().expect("the loop ran")
+
+    assert(measured.idle_time() > 0, "it slept waiting for the timer, and said so")
+    measured.close().expect("closed")

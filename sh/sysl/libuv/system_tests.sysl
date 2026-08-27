@@ -1,0 +1,220 @@
+module sh.sysl.libuv
+@tests
+
+// What libuv reports about the machine and the process.
+//
+// **A test about the machine can only assert what is true of every machine**, so nothing here pins
+// a number: what is checked is that the answers are internally consistent, that the two clocks agree
+// with each other, and that the calls which change process state change it and change it back.
+
+import sysl.text.from_utf8
+
+// -- Clocks -------------------------------------------------------------------------------------
+
+@test("the two wall clocks agree with each other")
+wall_clocks()
+    val (seconds, micros) = time_of_day().expect("the time of day")
+    val (clock_seconds, nanos) = clock(CLOCK_REALTIME).expect("the realtime clock")
+
+    assert(seconds > 1700000000, "it is some time after 2023")
+    assert(micros >= 0 && micros < 1000000, "the microseconds are within the second")
+    assert(nanos >= 0 && nanos < 1000000000, "and the nanoseconds within theirs")
+
+    // Two readings of the same clock a moment apart, so they agree to the second either side.
+    assert(clock_seconds - seconds <= 1 && seconds - clock_seconds <= 1, "and they are the same clock")
+
+// **`hrtime` and `clock(CLOCK_MONOTONIC)` are two monotonic clocks and not one**, which is the
+// thing worth pinning: on this machine they are seven seconds apart, because one counts the time
+// the machine spent asleep and the other does not. Both advance, and neither may be subtracted from
+// the other -- so what is checked is that each measures a sleep, rather than that they agree.
+@test("both monotonic clocks measure an interval, and they are not the same clock")
+monotonic_clocks()
+    val (before_s, before_n) = clock(CLOCK_MONOTONIC).expect("the monotonic clock")
+    val before_hr = hrtime()
+
+    assert(before_s > 0, "the clock has been running")
+
+    sleep(5)
+
+    val (after_s, after_n) = clock(CLOCK_MONOTONIC).expect("the monotonic clock")
+    val after_hr = hrtime()
+
+    val moved = (u64(after_s) * 1000000000 + u64(after_n)) - (u64(before_s) * 1000000000 + u64(before_n))
+
+    assert(moved >= 4000000, "the named clock measured the sleep")
+    assert(after_hr - before_hr >= 4000000, "and so did hrtime")
+
+@test("the monotonic clock never goes backwards across a sleep")
+monotonic_never_retreats()
+    val (before, _) = clock(CLOCK_MONOTONIC).expect("the monotonic clock")
+
+    sleep(2)
+
+    val (after, _) = clock(CLOCK_MONOTONIC).expect("the monotonic clock")
+
+    assert(after >= before, "time did not go backwards")
+
+// -- Memory -------------------------------------------------------------------------------------
+
+@test("the memory figures are consistent with each other")
+memory()
+    assert(total_memory() > 0, "the machine has memory")
+    assert(free_memory() <= total_memory(), "and free is a part of it")
+    assert(resident_memory().expect("rss") > 0, "this process is using some")
+    assert(u64(resident_memory().expect("rss")) < total_memory(), "and not all of it")
+
+    // `constrained_memory` is the cgroup's limit and is `0` where there is none, which is what an
+    // ordinary machine reports. **That zero is why `total_memory` is the wrong number to size a
+    // cache by in a container and the right one outside**, and a program has to read both.
+    val limit = constrained_memory()
+
+    assert(limit == 0 || limit <= total_memory(), "a limit, where there is one, is within the machine")
+    assert(available_memory() > 0, "and something is available")
+
+@test("the machine says how many threads are worth running")
+parallelism()
+    val n = available_parallelism()
+
+    assert(n >= 1, "at least one")
+    assert(n <= 4096, "and a number rather than nonsense")
+
+@test("the load averages are three numbers, or three zeroes where the platform has none")
+load()
+    val (one, five, fifteen) = loadavg()
+
+    assert(one >= 0.0, "the one-minute average is not negative")
+    assert(five >= 0.0, "nor the five-minute one")
+    assert(fifteen >= 0.0, "nor the fifteen-minute one")
+
+// -- The process --------------------------------------------------------------------------------
+
+// **A priority an unprivileged process lowers, it cannot raise again**, which is the kernel's rule
+// and not libuv's -- so this moves it one step and leaves it there rather than pretending it can be
+// put back. The step costs the rest of the suite nothing.
+@test("a process may lower its own priority and may not raise it back")
+priorities()
+    val before = priority().expect("a priority")
+
+    set_priority(before + 1).expect("lowered")
+    assert_eq(priority().expect("a priority"), before + 1)
+
+    assert(set_priority(before).is_err(), "and raising it again is refused")
+    assert_eq(priority().expect("a priority"), before + 1)
+
+@test("the process's directories are absolute paths that exist")
+directories()
+    val home = homedir().expect("a home directory")
+    val temp = tmpdir().expect("a temporary directory")
+    val exe = exepath().expect("the executable")
+
+    assert(home.len > 1 && home[0] == u8('/'), "an absolute path")
+    assert(temp.len > 1 && temp[0] == u8('/'), "and so is the temporary directory")
+    assert(exe.len > 1 && exe[0] == u8('/'), "and so is this program")
+
+    assert(stat_sync(home).expect("stat").is_dir(), "the home directory is a directory")
+    assert(stat_sync(temp).expect("stat").is_dir(), "and so is the temporary one")
+    assert(stat_sync(exe).expect("stat").is_file(), "and the executable is a file")
+
+@test("chdir moves the process, and cwd says where it is")
+changing_directory()
+    val here = cwd().expect("a directory")
+    val temp = realpath_sync(tmpdir().expect("a temporary directory")).expect("resolved")
+
+    chdir(temp).expect("moved")
+    assert_eq(realpath_sync(cwd().expect("a directory")).expect("resolved"), temp)
+
+    chdir(here).expect("moved back")
+    assert_eq(cwd().expect("a directory"), here)
+
+    assert(chdir("/no/such/path/anywhere").is_err(), "and it cannot move somewhere that is not there")
+
+@test("a child still starts after descriptor inheritance is turned off")
+inheritance()
+    val lp = default_loop()
+
+    // This is process-wide and cannot be undone, so what it has to be checked against is that
+    // spawning still works afterwards -- it stops a child inheriting descriptors it was not given,
+    // not descriptors it was.
+    disable_stdio_inheritance()
+
+    val out = pipe(false, lp).expect("a pipe")
+    val got: &Outcome = Outcome(0, -1)
+
+    val child = spawn("echo", ["ok"], no_exit_action,
+                      [Ignore, ToPipe(out, WRITABLE_PIPE), Inherit], "", [], 0,
+                      lp).expect("the child started")
+
+    assert(child.pid() > 0, "it has a process id")
+    assert_eq(child.on_loop().backend_fd(), lp.backend_fd())
+
+    child.on_exit((status, signal) ->
+        got.status = i32(status)
+        child.close())
+
+    out.read_start((r) -> r match
+        Data(bytes) -> got.n += bytes.len
+        End -> out.close()
+        Failed(_) -> out.close()).expect("reading")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.status, 0)
+    assert_eq(got.n, 3)
+
+@test("a child that is signalled reports the signal rather than a status")
+signalled_child()
+    val lp = default_loop()
+    val got: &Outcome = Outcome(0, -1)
+
+    val child = spawn("sleep", ["30"], no_exit_action, [Ignore, Ignore, Ignore], "", [], 0,
+                      lp).expect("the child started")
+
+    child.on_exit((status, signal) ->
+        got.status = i32(status)
+        got.n = usize(signal)
+        child.close())
+
+    child.kill(SIGTERM).expect("signalled")
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.status, 0)
+    assert_eq(got.n, usize(SIGTERM))
+
+@test("a child runs where it is told and with the environment it is given")
+child_environment()
+    val lp = default_loop()
+    val dir = realpath_sync(mkdtemp_sync("/tmp/libuv-sys-XXXXXX").expect("a directory")).expect("resolved")
+    val out = pipe(false, lp).expect("a pipe")
+    val got: &Text = Text("")
+
+    // `pwd` with no environment of its own but `PATH`, started in the directory just made: what it
+    // prints is both halves of the answer at once.
+    val child = spawn("/bin/pwd", [], no_exit_action,
+                      [Ignore, ToPipe(out, WRITABLE_PIPE), Inherit], dir, ["PATH=/usr/bin:/bin"], 0,
+                      lp).expect("the child started")
+
+    child.on_exit((status, signal) -> child.close())
+
+    out.read_start((r) -> r match
+        Data(bytes) ->
+            got.add(bytes)
+            out.close()
+        End -> out.close()
+        Failed(_) -> out.close()).expect("reading")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.text, dir + "\n")
+
+    rmdir_sync(dir).expect("removed")
+
+private no_exit_action(status: i64, signal: i32) -> unit = ()
+
+private struct Outcome
+    n: usize
+    status: i32
+
+private struct Text
+    text: string
+
+    add(*self, bytes: []const u8) = self.text = self.text + from_utf8(bytes).unwrap_or("")

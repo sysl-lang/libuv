@@ -41,6 +41,17 @@ int sysl_uv_ai_protocol(const struct addrinfo *ai);
 const struct sockaddr *sysl_uv_ai_addr(const struct addrinfo *ai);
 const char *sysl_uv_ai_canonname(const struct addrinfo *ai);
 
+/* Writing to a socket whose peer has gone raises SIGPIPE, whose default action ends the process --
+ * so a server that never asked for it dies on a client that hung up.  Ignoring it is what turns
+ * that into the `EPIPE` libuv reports through the write callback, and it is a `signal` call rather
+ * than anything of libuv's. */
+void sysl_uv_ignore_sigpipe(void);
+
+/* `uv_loop_configure` is variadic, which sysl has no way to spell.  Every option it takes wants at
+ * most one integer, and one it takes none for does not read the argument -- so a fixed signature
+ * answers for all of them. */
+int sysl_uv_loop_configure(uv_loop_t *loop, int option, int value);
+
 /* `uv_stdio_container_t` — a flag word and a union of a stream pointer and a descriptor. */
 void sysl_uv_stdio_set_fd(uv_stdio_container_t *stdio, int i, int flags, int fd);
 void sysl_uv_stdio_set_stream(uv_stdio_container_t *stdio, int i, int flags, uv_stream_t *stream);

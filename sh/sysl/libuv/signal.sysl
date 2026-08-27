@@ -95,6 +95,27 @@ signal(lp: &Loop = default_loop()) -> Result[&Signal, Error]
     c.handle_set_data(s.handle_ptr(), ptr_cast(&*s))
     Ok(s)
 
+/** Stop `SIGPIPE` ending this process, so that writing to a peer that has gone is reported as
+ * `EPIPE` through the write callback instead.
+ *
+ * **Every program in this package that writes to a socket or a pipe wants this, and wants it before
+ * it writes anything.** The default action for `SIGPIPE` is to end the process, and a client that
+ * hangs up mid-response is enough to trigger it -- so a server that has not called this dies from
+ * an ordinary event, with no diagnostic and with whatever it had buffered thrown away. It is one
+ * line at the top of `main`:
+ *
+ *     main()
+ *         ignore_sigpipe()
+ *         ...
+ *
+ * libuv does not do it for you, and neither does anything else: it is process-wide state, so it is
+ * the program's to set rather than a library's. Node.js does exactly this at startup.
+ *
+ * It is not a `Signal` watcher and needs no loop -- there is nothing to be told about, only a
+ * default to be turned off.
+ */
+ignore_sigpipe() = c.ignore_sigpipe()
+
 /** Send a signal to a process by pid, which is `kill(2)` and needs no loop and no handle.
  *
  * `signum` of `0` sends nothing and reports whether the process exists and could be signalled,

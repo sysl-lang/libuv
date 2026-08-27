@@ -33,6 +33,23 @@ main()
 `sysl run .` is the whole command: libuv installs a `libuv.pc` beside itself and the manifest asks
 the machine where the headers and the library are.
 
+## Call `ignore_sigpipe()` first
+
+**A server that writes to a client which hung up is killed by `SIGPIPE`** — the default action for
+it ends the process, with no diagnostic and with whatever was buffered thrown away. libuv does not
+turn that off for you and neither does anything else, because it is process-wide state and so the
+program's to set. One line at the top of `main` turns it into the `EPIPE` the write callback is
+meant to carry:
+
+```sysl
+main()
+    ignore_sigpipe()
+    ...
+```
+
+This package's own suite has the test that found it: without the call, that test does not fail — it
+ends the test runner.
+
 ## A handle stays alive until you close it
 
 This is the one rule the rest of the package is built on, and it is worth reading before anything
@@ -145,17 +162,17 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 
 | | |
 |---|---|
-| **loop** | `default_loop`, `new_loop`, `run`, `stop`, `alive`, `now`, `backend_fd`, `idle_time` |
+| **loop** | `default_loop`, `new_loop`, `run`, `stop`, `alive`, `now`, `backend_fd`, `configure`, `idle_time` |
 | **timers** | `timer`, `start`, `stop`, `again`, `set_repeat`, `due_in` |
 | **watchers** | `idle`, `prepare`, `check` |
 | **wake-ups** | `notifier` — the one handle another thread may touch |
-| **signals** | `signal`, `start`, `start_once`, `kill` |
+| **signals** | `signal`, `start`, `start_once`, `kill`, `ignore_sigpipe` |
 | **streams** | `read_start`, `write`, `try_write`, `shutdown`, `listen`, back-pressure |
 | **TCP** | `tcp`, `bind`, `listen`, `accept`, `connect`, `nodelay`, `keepalive`, `sockname` |
-| **pipes** | `pipe`, `pipe_pair`, and Unix domain sockets |
+| **pipes** | `pipe`, `pipe_pair`, `socket_pair`, and Unix domain sockets |
 | **terminals** | `tty`, `set_mode`, `winsize`, `reset_tty_mode`, `guess_handle` |
 | **names** | `resolve` — `getaddrinfo` on the thread pool |
-| **files, blocking** | `open_sync`, `read_file_sync`, `write_file_sync`, `stat_sync`, `scandir_sync`, … |
+| **files, blocking** | `open_sync`, `read_file_sync`, `write_file_sync`, `stat_sync`, `scandir_sync`, `symlink_sync`, … |
 | **files, not** | `open`, `read`, `write`, `stat`, `scandir`, `read_file`, … |
 | **children** | `spawn`, `Stdio`, `kill`, `on_exit` |
 | **the machine** | `hrtime`, `hostname`, `cwd`, `env`, `available_parallelism`, memory, load |
@@ -229,15 +246,29 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-Forty-three of them, and the thing under test is the binding rather than libuv. What is untested
-anywhere else is the arrangement this package is built on, and every case is chosen to fail if one of
-these is not true: a handle's storage stays where it was put, a handle stays alive with nothing naming
-it and is freed when it is closed, the address libuv hands a callback finds its way back to the right
-sysl handle, and a struct this side declares has the layout the header does.
+**A hundred and one of them, over five files, and every public entry point but two is named in one.**
+The two are `Loop.fork`, which needs a real `fork(2)` a sysl program has no way to make, and
+`Tty.winsize`, which needs a terminal with a slave attached — on a pty *master* macOS refuses it and
+Linux allows it, so a test either way would pin a platform rather than this binding. Both are said so
+at the site.
+
+The thing under test is the binding rather than libuv. What is untested anywhere else is the
+arrangement this package is built on, and every case is chosen to fail if one of these is not true: a
+handle's storage stays where it was put, a handle stays alive with nothing naming it and is freed
+when it is closed, the address libuv hands a callback finds its way back to the right sysl handle,
+and a struct this side declares has the layout the header does.
 
 The end-to-end ones are real: a TCP echo over the loopback on a port the kernel picked, a Unix domain
 socket in a temporary directory, `localhost` resolved on the thread pool, a file written and read
-back, and `echo hello` spawned with its output read through a pipe.
+back, `echo hello` spawned with its output read through a pipe, and `/bin/pwd` run in a directory it
+was given with an environment it was given.
+
+**Six things in this README were wrong until a test said so**, which is the argument for writing them:
+`again` refuses only a timer that was never started rather than one with no interval; `due_in` still
+reports a deadline after `stop`; `idle_time` answers zero until the loop is asked to measure it;
+`socket_pair` gives *Unix domain* sockets, so `Tcp.open` on one connects and then refuses every TCP
+option; `Pipe.chmod` takes `READABLE`/`WRITABLE` and not the stdio flags of nearly the same name; and
+`hrtime` does not share a base with `clock(CLOCK_MONOTONIC)` — seven seconds apart on this machine.
 
 ## A note on `?`
 

@@ -52,8 +52,12 @@ struct Timer
     /** Stop the timer and start it again with its repeat as the new timeout.
      *
      * This is the idle-timeout idiom: a connection sets a repeating timer for the timeout it will
-     * allow, and calls `again` on every byte that arrives. `EINVAL` for a timer whose repeat is
-     * `0`, which has no interval to be restarted with.
+     * allow, and calls `again` on every byte that arrives.
+     *
+     * **`EINVAL` means the timer was never started**, and nothing else -- checked against libuv
+     * rather than assumed. On a timer whose repeat is `0` it does **nothing at all** and answers
+     * `Ok`, because there is no interval to restart with; a caller relying on this to restart a
+     * one-shot wants `start` instead.
      */
     again(*self) -> Result[unit, Error] = checked(c.timer_again(self.raw()))
 
@@ -68,7 +72,13 @@ struct Timer
      */
     set_repeat(*self, repeat: u64) = c.timer_set_repeat(self.raw(), repeat)
 
-    /** How many milliseconds until this timer is next due, or `0` if it is not running. */
+    /** How many milliseconds until this timer is next due, measured against the loop's cached
+     * clock -- so it is what the loop would wait, not what a fresh reading would say.
+     *
+     * **A timer that has been stopped still reports the deadline it had**, since libuv reads the
+     * field without asking whether the timer is running. `0` means either "never started" or "the
+     * deadline has passed", and `is_active` is what separates a waiting timer from a stopped one.
+     */
     due_in(*self) -> u64 = c.timer_get_due_in(self.raw())
 end Timer
 

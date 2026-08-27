@@ -1,5 +1,6 @@
 #include "shim.h"
 
+#include <signal.h>
 #include <string.h>
 
 void sysl_uv_buf_set(uv_buf_t *buf, char *base, size_t len) {
@@ -44,6 +45,12 @@ int sysl_uv_ai_protocol(const struct addrinfo *ai) { return ai->ai_protocol; }
 const struct sockaddr *sysl_uv_ai_addr(const struct addrinfo *ai) { return ai->ai_addr; }
 
 const char *sysl_uv_ai_canonname(const struct addrinfo *ai) { return ai->ai_canonname; }
+
+void sysl_uv_ignore_sigpipe(void) { signal(SIGPIPE, SIG_IGN); }
+
+int sysl_uv_loop_configure(uv_loop_t *loop, int option, int value) {
+  return uv_loop_configure(loop, (uv_loop_option)option, value);
+}
 
 void sysl_uv_stdio_set_fd(uv_stdio_container_t *stdio, int i, int flags, int fd) {
   stdio[i].flags = (uv_stdio_flags)flags;

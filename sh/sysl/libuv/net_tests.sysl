@@ -1,0 +1,399 @@
+module sh.sysl.libuv
+@tests
+
+// The parts of a stream, a socket, a pipe and a terminal that the end-to-end cases in `tests.sysl`
+// do not reach.
+//
+// **A socket pair is what most of this is built on.** `socket_pair` and `pipe_pair` hand back two
+// connected descriptors with no address, no listener and no kernel queue in the way -- so a test
+// about writing, back-pressure or blocking mode is about that and not about a connection being
+// established first.
+
+import sysl.buf.{Buf, buf}
+
+private struct Seen
+    bytes: Buf[u8]
+    code: i32
+    count: usize
+    done: bool
+
+private seen() -> &Seen = Seen(buf(), 0, 0, false)
+
+// Two connected handles with no address, no listener and no kernel queue in the way, which also
+// exercises `Pipe.open`.
+//
+// **They are `Pipe` handles rather than `Tcp` ones**, because `socket_pair` answers with Unix
+// domain sockets whatever its name suggests. Adopting one with `Tcp` compiles, connects and then
+// refuses every TCP option -- which is how this was found.
+private connected_pair(lp: &Loop) -> (&Pipe, &Pipe)
+    val (a, b) = socket_pair().expect("a socket pair")
+    val one = pipe(false, lp).expect("a pipe")
+    val two = pipe(false, lp).expect("a pipe")
+
+    one.open(a).expect("adopted")
+    two.open(b).expect("adopted")
+    (one, two)
+
+// A real TCP connection over the loopback, which the socket-option tests need and a socket pair
+// cannot give them. The port is the kernel's choice, so nothing here can collide with a machine.
+private connected_tcp(lp: &Loop) -> (&Tcp, &Tcp, &Tcp)
+    val server = tcp(lp).expect("a socket")
+
+    server.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+
+    val where = server.sockname().expect("the port")
+    val held: &Pair = Pair(None, None)
+
+    server.listen(4, () -> held.accepted = Some(server.accept().expect("a connection")))
+
+    val client = tcp(lp).expect("a socket")
+
+    client.connect(where, (r) ->
+        r.expect("connected")
+        held.connected = Some(client)).expect("connecting")
+
+    while held.accepted.is_none() || held.connected.is_none()
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    (server, client, held.accepted.expect("a connection"))
+
+private struct Pair
+    accepted: Option[&Tcp]
+    connected: Option[&Tcp]
+
+// -- Streams --------------------------------------------------------------------------------------
+
+@test("an adopted socket is readable and writable, and a closed peer takes the readable half")
+readable_and_writable()
+    val lp = default_loop()
+    val (one, two) = connected_pair(lp)
+
+    assert(one.is_readable(), "a connected socket can be read")
+    assert(one.is_writable(), "and written")
+    assert_eq(one.write_queue_size(), 0)
+
+    val seen = seen()
+
+    one.read_start((r) -> r match
+        Data(_) -> seen.count += 1
+        End ->
+            seen.done = true
+            one.close()
+        Failed(e) ->
+            seen.code = e.code
+            one.close()).expect("reading")
+
+    // Shutting down the far end is what the near end sees as the end of the stream.
+    two.shutdown((r) -> r.expect("shut down")).expect("shutting down")
+
+    lp.run(RUN_ONCE).expect("the loop turned")
+    lp.run().expect("the loop ran")
+
+    assert(seen.done, "the end of the stream arrived as End rather than as a failure")
+    assert_eq(seen.code, 0)
+
+    two.close()
+    lp.run().expect("the loop ran")
+
+@test("read_stop stops delivery and read_start resumes it")
+stopping_and_resuming()
+    val lp = default_loop()
+    val (one, two) = connected_pair(lp)
+    val got = seen()
+
+    one.read_start((r) -> r match
+        Data(bytes) -> got.bytes.extend(bytes)
+        End -> one.close()
+        Failed(_) -> one.close()).expect("reading")
+
+    two.write([1, 2]).expect("queued")
+    lp.run(RUN_ONCE).expect("the loop turned")
+    lp.run(RUN_NOWAIT).expect("the loop turned")
+
+    assert_eq(got.bytes.len(), 2)
+
+    // Stopped: what arrives now waits in the kernel rather than in the callback.
+    one.read_stop().expect("stopped")
+    two.write([3, 4]).expect("queued")
+    lp.run(RUN_NOWAIT).expect("the loop turned")
+    lp.run(RUN_NOWAIT).expect("the loop turned")
+
+    assert_eq(got.bytes.len(), 2)
+
+    // And resuming delivers what was waiting.
+    one.read_start((r) -> r match
+        Data(bytes) -> got.bytes.extend(bytes)
+        End -> one.close()
+        Failed(_) -> one.close()).expect("reading again")
+
+    lp.run(RUN_ONCE).expect("the loop turned")
+
+    assert_eq(got.bytes.len(), 4)
+    assert_eq(got.bytes[3], 4)
+
+    one.close()
+    two.close()
+    lp.run().expect("the loop ran")
+
+@test("the write callback runs when the write has been taken, not when it was queued")
+write_callback()
+    val lp = default_loop()
+    val (one, two) = connected_pair(lp)
+    val wrote = seen()
+
+    two.write([1, 2, 3], (r) ->
+        r.expect("written")
+        wrote.done = true).expect("queued")
+
+    assert(!wrote.done, "not before the loop runs")
+
+    one.read_start((r) -> r match
+        Data(bytes) ->
+            wrote.count += bytes.len
+            one.close()
+        End -> one.close()
+        Failed(_) -> one.close()).expect("reading")
+
+    lp.run(RUN_ONCE).expect("the loop turned")
+    lp.run().expect("the loop ran")
+
+    assert(wrote.done, "the write completed")
+    assert_eq(wrote.count, 3)
+
+    two.close()
+    lp.run().expect("the loop ran")
+
+@test("try_write takes what the kernel will take now, and queues nothing")
+trying_to_write()
+    val lp = default_loop()
+    val (one, two) = connected_pair(lp)
+
+    val n = two.try_write([1, 2, 3, 4, 5]).expect("written")
+
+    assert_eq(n, 5)
+    assert_eq(two.write_queue_size(), 0)
+
+    val got = seen()
+
+    one.read_start((r) -> r match
+        Data(bytes) ->
+            got.bytes.extend(bytes)
+            one.close()
+        End -> one.close()
+        Failed(_) -> one.close()).expect("reading")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.bytes.len(), 5)
+    assert_eq(got.bytes[4], 5)
+
+    two.close()
+    lp.run().expect("the loop ran")
+
+// **Without `ignore_sigpipe` this test does not fail -- it ends the process**, exit 141, with no
+// diagnostic and with everything the runner had buffered thrown away. That is what a server meets
+// when a client hangs up mid-response, so the call is what makes the failure reportable at all.
+//
+// It is process-wide, so it is set once here and every test after it is a little safer for it.
+@test("a write to a peer that has gone is EPIPE in the callback, not the end of the process")
+write_to_nobody()
+    ignore_sigpipe()
+
+    val lp = default_loop()
+    val (one, two) = connected_pair(lp)
+    val failed = seen()
+
+    one.close()
+    lp.run(RUN_NOWAIT).expect("the loop turned")
+
+    two.write([1, 2, 3], (r) ->
+        failed.done = true
+
+        r match
+            Ok(_) -> failed.code = 0
+            Err(e) -> failed.code = e.code).expect("queued")
+
+    lp.run().expect("the loop ran")
+
+    assert(failed.done, "the callback ran")
+    assert_eq(failed.code, EPIPE)
+
+    two.close()
+    lp.run().expect("the loop ran")
+
+@test("blocking mode is accepted on a pipe, which is where libuv says to use it")
+blocking_writes()
+    val lp = default_loop()
+    val (a, b) = pipe_pair().expect("a pipe pair")
+    val reader = pipe(false, lp).expect("a pipe")
+    val writer = pipe(false, lp).expect("a pipe")
+
+    reader.open(a).expect("adopted")
+    writer.open(b).expect("adopted")
+
+    writer.set_blocking(true).expect("blocking")
+    writer.write([1, 2, 3]).expect("queued")
+    writer.set_blocking(false).expect("not blocking")
+
+    val got = seen()
+
+    reader.read_start((r) -> r match
+        Data(bytes) ->
+            got.bytes.extend(bytes)
+            reader.close()
+        End -> reader.close()
+        Failed(_) -> reader.close()).expect("reading")
+
+    lp.run(RUN_ONCE).expect("the loop turned")
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.bytes.len(), 3)
+
+    writer.close()
+    lp.run().expect("the loop ran")
+
+// -- TCP ------------------------------------------------------------------------------------------
+
+@test("the TCP options are accepted on a real TCP connection")
+socket_options()
+    val lp = default_loop()
+    val (server, client, conn) = connected_tcp(lp)
+
+    client.nodelay(true).expect("nagle off")
+    client.nodelay(false).expect("nagle on")
+    client.keepalive(true, 30).expect("keepalive on")
+    client.keepalive(false).expect("keepalive off")
+    server.simultaneous_accepts(true).expect("accepted")
+
+    assert(client.peername().expect("a peer").port() > 0, "the client knows what it connected to")
+    assert_eq(conn.sockname().expect("a name").ip(), "127.0.0.1")
+
+    client.close()
+    conn.close()
+    server.close()
+    lp.run().expect("the loop ran")
+
+@test("close_reset breaks the connection instead of ending it, and the peer sees a reset")
+resetting()
+    val lp = default_loop()
+    val (server, client, conn) = connected_tcp(lp)
+    val got = seen()
+
+    conn.read_start((r) -> r match
+        Data(_) -> got.count += 1
+        End ->
+            got.done = true
+            conn.close()
+        Failed(e) ->
+            got.code = e.code
+            conn.close()).expect("reading")
+
+    client.close_reset().expect("reset")
+    server.close()
+    lp.run().expect("the loop ran")
+
+    // A reset is a failure at the other end rather than the orderly end a `shutdown` produces,
+    // which is the whole difference between `close_reset` and `close`.
+    assert(!got.done, "the peer did not see an orderly end")
+    assert_eq(got.code, ECONNRESET)
+
+// **A socket pair is a pair of UNIX DOMAIN sockets**, whatever the name suggests, and this is what
+// pins it: `guess_handle` says named pipe, and adopting one with `Tcp` gets a handle that connects
+// and then refuses every TCP option. The binding says so now because this test said so first.
+@test("a socket pair is two ends of one Unix domain connection, not a TCP one")
+socket_pairs()
+    val (a, b) = socket_pair().expect("a pair")
+
+    assert(a >= 0, "the first is a descriptor")
+    assert(b >= 0, "and so is the second")
+    assert(a != b, "and they are two of them")
+    assert_eq(guess_handle(a), HANDLE_NAMED_PIPE)
+
+    val lp = default_loop()
+    val one = pipe(false, lp).expect("a pipe")
+    val wrong = tcp(lp).expect("a socket")
+
+    one.open(a).expect("adopted")
+    assert(one.is_writable(), "and it is connected")
+
+    // Adopted as a TCP socket it still opens -- and the first thing that is actually about TCP is
+    // refused, which is the failure a program would otherwise meet much later.
+    wrong.open(b).expect("adopted")
+    assert(wrong.nodelay(true).is_err(), "there is no Nagle on a socket with no network under it")
+
+    one.close()
+    wrong.close()
+    lp.run().expect("the loop ran")
+
+// -- Pipes ----------------------------------------------------------------------------------------
+
+@test("a pipe pair is a one-way pipe, readable at one end and writable at the other")
+pipe_pairs()
+    val lp = default_loop()
+    val (a, b) = pipe_pair().expect("a pipe pair")
+    val reader = pipe(false, lp).expect("a pipe")
+    val writer = pipe(false, lp).expect("a pipe")
+
+    reader.open(a).expect("adopted")
+    writer.open(b).expect("adopted")
+
+    assert(reader.is_readable(), "the read end reads")
+    assert(writer.is_writable(), "and the write end writes")
+
+    reader.close()
+    writer.close()
+    lp.run().expect("the loop ran")
+
+@test("a bound pipe is chmod-able and knows its own name")
+pipe_naming()
+    val lp = default_loop()
+    val dir = mkdtemp_sync("/tmp/libuv-net-XXXXXX").expect("a temporary directory")
+    val path = dir + "/named"
+    val server = pipe(false, lp).expect("a pipe")
+
+    server.bind(path).expect("bound")
+
+    assert_eq(server.sockname().expect("a name"), path)
+    assert(server.peername().is_err(), "a listener has no peer")
+
+    // `READABLE`/`WRITABLE`, not `READABLE_PIPE`/`WRITABLE_PIPE` -- two pairs of names for two
+    // questions, and the stdio pair is refused here.
+    server.chmod(READABLE | WRITABLE).expect("chmod")
+    assert(server.chmod(READABLE_PIPE | WRITABLE_PIPE).is_err(), "the stdio flags are not these")
+
+    server.close()
+    lp.run().expect("the loop ran")
+
+    rmdir_sync(dir).expect("removed")
+
+// -- Terminals ------------------------------------------------------------------------------------
+
+// **`winsize` is the one thing here with no test, and the reason is worth writing down.** It needs
+// a terminal with a slave attached: on a pty *master* macOS refuses it and Linux allows it, so a
+// test either way would pin one platform's behaviour rather than this binding's, and a test runner
+// has no controlling terminal to use instead. Raw and I/O mode are refused on a master for the same
+// reason. Everything that does not need a slave is checked.
+@test("a pty is a terminal, a handle opens on it, and normal mode is set through it")
+terminals()
+    val lp = default_loop()
+    val master = open_sync("/dev/ptmx", O_RDWR).expect("a pseudo-terminal")
+
+    assert_eq(guess_handle(master.descriptor()), HANDLE_TTY)
+
+    val t = tty(master.descriptor(), lp).expect("a terminal handle")
+
+    assert_eq(t.fileno().expect("a descriptor"), master.descriptor())
+    t.set_mode(TTY_MODE_NORMAL).expect("normal mode")
+
+    t.close()
+    lp.run().expect("the loop ran")
+
+    // **libuv owns the descriptor once a handle has adopted it** and closed it with the handle, so
+    // closing it a second time is `EBADF`. A program that opened the terminal itself must not.
+    assert_eq(master.close_sync().unwrap_err(), Error(EBADF))
+
+@test("resetting the terminal mode is safe from a process that never changed it")
+resetting_the_terminal()
+    // It is the process's terminal rather than any handle's, so this is what a program calls on the
+    // way out -- including the way out of a failure, where nothing may have been set at all.
+    reset_tty_mode().expect("reset")

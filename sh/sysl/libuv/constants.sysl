@@ -161,6 +161,19 @@ c const
 c const
     TCP_IPV6ONLY: u32 = "UV_TCP_IPV6ONLY"
 
+// ## Readable and writable
+//
+// One pair of numbers with two jobs, which is libuv's own arrangement: they are what a poll watcher
+// asks about, and they are what `Pipe.chmod` grants. **They are not the `READABLE_PIPE` and
+// `WRITABLE_PIPE` a child's stdio takes**, which are different numbers for a different question --
+// passing those to `chmod` is refused, which is how the difference was found.
+
+c const
+    READABLE: i32 = "UV_READABLE"
+    WRITABLE: i32 = "UV_WRITABLE"
+    DISCONNECT: i32 = "UV_DISCONNECT"
+    PRIORITIZED: i32 = "UV_PRIORITIZED"
+
 // ## Terminals
 
 c const
@@ -224,6 +237,15 @@ c const
     DIRENT_SOCKET: i32 = "UV_DIRENT_SOCKET"
     DIRENT_CHAR: i32 = "UV_DIRENT_CHAR"
     DIRENT_BLOCK: i32 = "UV_DIRENT_BLOCK"
+
+// ## What a loop can be asked to do differently
+//
+// `METRICS_IDLE_TIME` is the one worth knowing: **without it `idle_time` answers zero forever**,
+// because libuv does not measure what nobody asked for.
+
+c const
+    LOOP_BLOCK_SIGNAL: i32 = "UV_LOOP_BLOCK_SIGNAL"
+    METRICS_IDLE_TIME: i32 = "UV_METRICS_IDLE_TIME"
 
 // ## Clocks
 

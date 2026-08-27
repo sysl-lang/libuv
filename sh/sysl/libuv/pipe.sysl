@@ -85,8 +85,10 @@ struct Pipe
     /** The other end's name, which a Unix domain socket usually does not have. */
     peername(*self) -> Result[string, Error] = self.name_through(false)
 
-    /** Let others read from or write to the socket file. `READABLE_PIPE`, `WRITABLE_PIPE`, or both
-     * together.
+    /** Let others read from or write to the socket file. `READABLE`, `WRITABLE`, or both together.
+     *
+     * **Not `READABLE_PIPE` and `WRITABLE_PIPE`**, which are a child's stdio flags and are refused
+     * here -- two pairs of names for two questions, and libuv's own header is where they diverge.
      */
     chmod(*self, flags: i32) -> Result[unit, Error] = checked(c.pipe_chmod(self.raw(), flags))
 

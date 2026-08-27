@@ -285,6 +285,8 @@ extern "uv_pipe_getsockname" pipe_getsockname(h: *Pipe, buffer: *u8, size: *usiz
 extern "uv_pipe_getpeername" pipe_getpeername(h: *Pipe, buffer: *u8, size: *usize) -> i32
 extern "uv_pipe_chmod" pipe_chmod(h: *Pipe, flags: i32) -> i32
 extern "uv_pipe" pipe_pair(fds: *i32, read_flags: i32, write_flags: i32) -> i32
+extern "uv_socketpair" socketpair(kind: i32, protocol: i32, socks: *i32, flags0: i32,
+                                  flags1: i32) -> i32
 
 // ## TTY
 
@@ -423,6 +425,10 @@ extern "sysl_uv_ai_socktype" ai_socktype(ai: *AddrInfo) -> i32
 extern "sysl_uv_ai_protocol" ai_protocol(ai: *AddrInfo) -> i32
 extern "sysl_uv_ai_addr" ai_addr(ai: *AddrInfo) -> *SockAddr
 extern "sysl_uv_ai_canonname" ai_canonname(ai: *AddrInfo) -> *u8
+
+extern "sysl_uv_ignore_sigpipe" ignore_sigpipe()
+
+extern "sysl_uv_loop_configure" loop_configure(l: *Loop, option: i32, value: i32) -> i32
 
 extern "sysl_uv_stdio_set_fd" stdio_set_fd(stdio: *StdioContainer, i: i32, flags: i32, fd: i32)
 extern "sysl_uv_stdio_set_stream" stdio_set_stream(stdio: *StdioContainer, i: i32, flags: i32,

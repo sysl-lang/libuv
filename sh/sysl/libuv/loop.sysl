@@ -87,10 +87,22 @@ struct Loop
      */
     backend_fd(*self) -> i32 = c.backend_fd(self.p)
 
-    /** How long the loop has spent idle, in nanoseconds. Only counted when the loop was built with
-     * metrics on, which is the default; it answers `0` otherwise rather than failing.
+    /** How long the loop has spent blocked waiting for I/O, in nanoseconds.
+     *
+     * **It answers `0` until the loop has been asked to measure it**, which is
+     * `configure(METRICS_IDLE_TIME)` and has to be done before `run`. libuv does not collect what
+     * nobody asked for, and there is nothing to distinguish "not measuring" from "never idle" --
+     * checked here rather than taken from the documentation.
      */
     idle_time(*self) -> u64 = c.metrics_idle_time(self.p)
+
+    /** Change how the loop behaves. `METRICS_IDLE_TIME` turns on the measurement `idle_time`
+     * reports; `LOOP_BLOCK_SIGNAL` takes a signal number and stops the loop being woken by it.
+     *
+     * **Call it before `run`.** `ENOSYS` is what an option the platform does not have answers with.
+     */
+    configure(*self, option: i32, value: i32 = 0) -> Result[unit, Error] =
+        checked(c.loop_configure(self.p, option, value))
 
     /** Release a loop of your own. **Not for the default loop**, and not for a loop with anything
      * still open on it: libuv answers `EBUSY` for both, and nothing is released.

@@ -139,7 +139,9 @@ struct Tcp
 
     /** Adopt a socket the program got from somewhere else -- inherited, or made by hand.
      *
-     * **libuv owns it afterwards**, and closing it any other way breaks the handle.
+     * **libuv owns it afterwards**, and closing it any other way breaks the handle. It must be a
+     * *TCP* socket: a Unix domain one, which is what `socket_pair` answers with, wants `Pipe.open`
+     * instead, and the difference does not show up until a TCP option is set on it.
      */
     open(*self, fd: i32) -> Result[unit, Error] = checked(c.tcp_open(self.raw(), fd))
 end Tcp
@@ -164,6 +166,21 @@ impl Stream for Tcp
     stream_ptr(*self) -> *c.Stream = ptr_cast(&self.storage[0])
 
     stream_state(*self) -> *StreamState = &self.st
+
+/** A pair of connected sockets, which is `socketpair(2)`: whatever is written to one is read at the
+ * other, and neither needs an address.
+ *
+ * **They are Unix domain sockets rather than TCP ones**, whatever the name suggests, so the handle
+ * to adopt one with is `Pipe` and not `Tcp` -- `guess_handle` says `HANDLE_NAMED_PIPE`, and
+ * `nodelay` on one is refused because there is no Nagle on a socket with no network under it. This
+ * is how a parent hands a connected socket to a child process, and the shortest way to a connected
+ * pair for a program that has no network to reach across.
+ */
+socket_pair(kind: i32 = SOCK_STREAM, protocol: i32 = 0) -> Result[(i32, i32), Error]
+    var socks: [2]i32 = [0, 0]
+    val r = c.socketpair(kind, protocol, &socks[0], 0, 0)
+
+    if r < 0 then Err(Error(r)) else Ok((socks[0], socks[1]))
 
 /** A TCP socket on `lp`, bound to nothing and connected to nothing.
  *

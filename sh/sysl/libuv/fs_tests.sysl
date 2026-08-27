@@ -1,0 +1,423 @@
+module sh.sysl.libuv
+@tests
+
+// The file system half, both ways round.
+//
+// **Everything here happens inside a directory made by `mkdtemp_sync`**, so nothing depends on what
+// is already on the machine and two copies of the suite cannot collide. Each test removes what it
+// made, which is also how `unlink_sync`, `rmdir_sync` and the failure they report for a path that is
+// not there get exercised without a test of their own.
+
+import sysl.buf.{Buf, buf}
+
+// A directory of this test's own.
+private scratch() -> string = mkdtemp_sync("/tmp/libuv-fs-XXXXXX").expect("a temporary directory")
+
+// Somewhere for an asynchronous callback to leave what it was handed.
+private struct Landed
+    bytes: Buf[u8]
+    text: string
+    count: usize
+    code: i32
+    size: u64
+    done: bool
+
+private nothing_landed() -> &Landed = Landed(buf(), "", 0, 0, 0, false)
+
+// -- A file, by hand ------------------------------------------------------------------------------
+
+@test("a file is opened, written, positioned, read back, and closed")
+file_by_hand()
+    val dir = scratch()
+    val path = dir + "/notes"
+    val f = open_sync(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR).expect("opened")
+
+    assert(f.descriptor() >= 0, "an open file has a descriptor")
+    assert_eq(f.write_sync([1, 2, 3, 4, 5]).expect("written"), 5)
+
+    var back: []u8 = [0; 5]
+
+    // Offset 0 rather than the position, which is at the end after that write.
+    assert_eq(f.read_sync(back, 0).expect("read"), 5)
+    assert_eq(back[0], 1)
+    assert_eq(back[4], 5)
+
+    // And a read past the end is zero bytes rather than a failure.
+    assert_eq(f.read_sync(back, 5).expect("read past the end"), 0)
+
+    f.close_sync().expect("closed")
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("write_all_sync writes every byte, however many calls that takes")
+write_all()
+    val dir = scratch()
+    val path = dir + "/all"
+    val f = open_sync(path, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR).expect("opened")
+
+    var big: []u8 = [7; 40000]
+
+    f.write_all_sync(big).expect("written")
+    f.close_sync().expect("closed")
+
+    assert_eq(stat_sync(path).expect("stat").size, 40000)
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("truncate cuts a file, and extends one with zeroes")
+truncating()
+    val dir = scratch()
+    val path = dir + "/cut"
+    val f = open_sync(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR).expect("opened")
+
+    f.write_sync([1, 2, 3, 4, 5, 6, 7, 8]).expect("written")
+    f.truncate_sync(3).expect("cut")
+    assert_eq(f.stat_sync().expect("stat").size, 3)
+
+    f.truncate_sync(10).expect("extended")
+
+    val info = f.stat_sync().expect("stat")
+
+    assert_eq(info.size, 10)
+    assert(info.is_file(), "it is still a file")
+
+    var back: []u8 = [9; 10]
+
+    assert_eq(f.read_sync(back, 0).expect("read"), 10)
+    assert_eq(back[2], 3)
+    assert_eq(back[3], 0)
+
+    f.close_sync().expect("closed")
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a flush of either kind reports success on a file that is open")
+flushing()
+    val dir = scratch()
+    val path = dir + "/flushed"
+    val f = open_sync(path, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR).expect("opened")
+
+    f.write_sync([1, 2, 3]).expect("written")
+    f.flush_sync().expect("flushed")
+    f.flush_data_sync().expect("data flushed")
+    f.close_sync().expect("closed")
+
+    // And every one of those on a closed descriptor is EBADF rather than a crash.
+    assert_eq(f.flush_sync().unwrap_err(), Error(EBADF))
+    assert_eq(f.stat_sync().unwrap_err(), Error(EBADF))
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a file opened with O_EXCL twice is refused the second time")
+exclusive()
+    val dir = scratch()
+    val path = dir + "/once"
+    val f = open_sync(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR).expect("opened")
+
+    f.close_sync().expect("closed")
+    assert_eq(open_sync(path, O_WRONLY | O_CREAT | O_EXCL).unwrap_err(), Error(EEXIST))
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+// -- Paths ----------------------------------------------------------------------------------------
+
+@test("renaming moves a file and leaves nothing behind")
+renaming()
+    val dir = scratch()
+
+    write_file_sync(dir + "/a", [1, 2]).expect("written")
+    rename_sync(dir + "/a", dir + "/b").expect("renamed")
+
+    assert(stat_sync(dir + "/a").is_err(), "the old name is gone")
+    assert_eq(stat_sync(dir + "/b").expect("stat").size, 2)
+
+    unlink_sync(dir + "/b").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("copying makes a second file with the same contents")
+copying()
+    val dir = scratch()
+
+    write_file_sync(dir + "/src", [5, 6, 7]).expect("written")
+    copyfile_sync(dir + "/src", dir + "/dst").expect("copied")
+
+    val back = read_file_sync(dir + "/dst").expect("read")
+
+    assert_eq(back.len, 3)
+    assert_eq(back[1], 6)
+    assert(stat_sync(dir + "/src").is_ok(), "and the original is still there")
+
+    unlink_sync(dir + "/src").expect("removed")
+    unlink_sync(dir + "/dst").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("chmod changes what access reports")
+permissions()
+    val dir = scratch()
+    val path = dir + "/locked"
+
+    write_file_sync(path, [1]).expect("written")
+
+    chmod_sync(path, S_IRUSR).expect("made read-only")
+    assert(access_sync(path, R_OK).is_ok(), "it can still be read")
+
+    chmod_sync(path, S_IRUSR | S_IWUSR).expect("made writable again")
+    assert(access_sync(path, W_OK).is_ok(), "and now written")
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a symbolic link is followed by stat and reported by lstat")
+symbolic_links()
+    val dir = scratch()
+    val target = dir + "/target"
+    val link = dir + "/link"
+
+    write_file_sync(target, [1, 2, 3]).expect("written")
+    symlink_sync(target, link).expect("linked")
+
+    // `stat` follows it, so it reports the file at the other end.
+    val followed = stat_sync(link).expect("stat")
+
+    assert(followed.is_file(), "what it points at is a file")
+    assert(!followed.is_link(), "and stat never reports a link")
+    assert_eq(followed.size, 3)
+
+    // `lstat` reports the link itself.
+    val itself = lstat_sync(link).expect("lstat")
+
+    assert(itself.is_link(), "lstat reports the link")
+    assert(!itself.is_file(), "and it is not the file")
+
+    assert_eq(readlink_sync(link).expect("read"), target)
+    assert(readlink_sync(target).is_err(), "and a file that is not a link has nothing to read")
+
+    // The directory sees it as a link too, without a stat of its own.
+    val listed = scandir_sync(dir).expect("listed")
+    var links = 0
+
+    for e in listed
+        if e.is_link() then links += 1
+
+    assert_eq(links, 1)
+
+    unlink_sync(link).expect("removed")
+    unlink_sync(target).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a hard link is the same file under a second name")
+hard_links()
+    val dir = scratch()
+
+    write_file_sync(dir + "/one", [4, 5]).expect("written")
+    link_sync(dir + "/one", dir + "/two").expect("linked")
+
+    val a = stat_sync(dir + "/one").expect("stat")
+    val b = stat_sync(dir + "/two").expect("stat")
+
+    assert_eq(a.ino, b.ino)
+    assert_eq(a.dev, b.dev)
+    assert_eq(b.nlink, 2)
+
+    unlink_sync(dir + "/one").expect("removed")
+    assert_eq(read_file_sync(dir + "/two").expect("read").len, 2)
+
+    unlink_sync(dir + "/two").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("realpath resolves what a link and a dot-dot hide")
+real_paths()
+    val dir = scratch()
+
+    mkdir_sync(dir + "/inner").expect("made")
+
+    val roundabout = dir + "/inner/../inner"
+    val resolved = realpath_sync(roundabout).expect("resolved")
+
+    assert(resolved.len > 0, "it answered something")
+    assert_eq(resolved, realpath_sync(dir + "/inner").expect("resolved"))
+    assert(realpath_sync("/no/such/path/anywhere").is_err(), "and nothing for a path that is not")
+
+    rmdir_sync(dir + "/inner").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a directory that is not empty refuses to be removed")
+rmdir_refuses()
+    val dir = scratch()
+
+    write_file_sync(dir + "/held", [1]).expect("written")
+    assert_eq(rmdir_sync(dir).unwrap_err(), Error(ENOTEMPTY))
+
+    unlink_sync(dir + "/held").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("mkdir_sync makes one level and only one")
+mkdir_one_level()
+    val dir = scratch()
+
+    mkdir_sync(dir + "/a").expect("made")
+    assert(stat_sync(dir + "/a").expect("stat").is_dir(), "it is a directory")
+    assert_eq(mkdir_sync(dir + "/a").unwrap_err(), Error(EEXIST))
+    assert_eq(mkdir_sync(dir + "/b/c").unwrap_err(), Error(ENOENT))
+
+    rmdir_sync(dir + "/a").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+// -- On the thread pool ---------------------------------------------------------------------------
+
+// Every one of these has to answer *after* `run` starts and not before, which is the property that
+// separates a real thread-pool call from one that quietly ran inline.
+
+@test("open, write, read and close all run on the pool")
+async_file_round_trip()
+    val lp = default_loop()
+    val dir = scratch()
+    val path = dir + "/async"
+    val got = nothing_landed()
+
+    open(path, (opened) ->
+        opened match
+            Err(e) -> got.code = e.code
+            Ok(f) ->
+                write(f, [9, 8, 7], (written) ->
+                    written match
+                        Err(e) -> got.code = e.code
+                        Ok(n) ->
+                            got.count = n
+
+                            read(f, 16, (r) ->
+                                r match
+                                    Err(e) -> got.code = e.code
+                                    Ok(bytes) ->
+                                        got.bytes.extend(bytes)
+                                        got.done = true
+
+                                close(f, ignore_status, lp), 0, lp), -1, lp),
+        O_RDWR | O_CREAT, S_IRUSR | S_IWUSR, lp).expect("the open started")
+
+    assert(!got.done, "nothing has happened before the loop runs")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.code, 0)
+    assert_eq(got.count, 3)
+    assert_eq(got.bytes.len(), 3)
+    assert_eq(got.bytes[0], 9)
+    assert_eq(got.bytes[2], 7)
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a directory made, listed and removed, all on the pool")
+async_directory()
+    val lp = default_loop()
+    val dir = scratch()
+    val got = nothing_landed()
+
+    mkdir(dir + "/made", (r) ->
+        r.expect("made")
+
+        scandir(dir, (listed) ->
+            listed match
+                Err(e) -> got.code = e.code
+                Ok(entries) ->
+                    got.count = entries.len
+
+                    for e in entries
+                        if e.is_dir() then got.text = e.name
+
+                    rmdir(dir + "/made", (done) ->
+                        done.expect("removed")
+                        got.done = true, lp), lp), 511, lp).expect("the mkdir started")
+
+    lp.run().expect("the loop ran")
+
+    assert(got.done, "every step ran")
+    assert_eq(got.code, 0)
+    assert_eq(got.count, 1)
+    assert_eq(got.text, "made")
+
+    rmdir_sync(dir).expect("removed")
+
+@test("stat, lstat and realpath answer on the loop")
+async_paths()
+    val lp = default_loop()
+    val dir = scratch()
+    val target = dir + "/t"
+    val link = dir + "/l"
+    val followed = nothing_landed()
+    val itself = nothing_landed()
+    val resolved = nothing_landed()
+
+    write_file_sync(target, [1, 2, 3, 4]).expect("written")
+    symlink_sync(target, link).expect("linked")
+
+    stat(link, (r) ->
+        r match
+            Ok(s) ->
+                followed.size = s.size
+                followed.done = s.is_file()
+            Err(e) -> followed.code = e.code, lp).expect("the stat started")
+
+    lstat(link, (r) ->
+        r match
+            Ok(s) -> itself.done = s.is_link()
+            Err(e) -> itself.code = e.code, lp).expect("the lstat started")
+
+    realpath(target, (r) ->
+        r match
+            Ok(p) -> resolved.text = p
+            Err(e) -> resolved.code = e.code, lp).expect("the realpath started")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(followed.size, 4)
+    assert(followed.done, "stat followed the link to a file")
+    assert(itself.done, "and lstat reported the link")
+    assert_eq(resolved.text, realpath_sync(target).expect("resolved"))
+
+    unlink_sync(link).expect("removed")
+    unlink_sync(target).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("renaming and unlinking on the pool")
+async_rename_and_unlink()
+    val lp = default_loop()
+    val dir = scratch()
+    val got = nothing_landed()
+
+    write_file_sync(dir + "/from", [1]).expect("written")
+
+    rename(dir + "/from", dir + "/to", (r) ->
+        r.expect("renamed")
+
+        unlink(dir + "/to", (done) ->
+            done.expect("removed")
+            got.done = true, lp), lp).expect("the rename started")
+
+    lp.run().expect("the loop ran")
+
+    assert(got.done, "both steps ran")
+    assert(stat_sync(dir + "/to").is_err(), "and the file is gone")
+
+    rmdir_sync(dir).expect("removed")
+
+@test("an asynchronous open of nothing fails in the callback rather than at the call")
+async_open_missing()
+    val lp = default_loop()
+    val got = nothing_landed()
+
+    open("/no/such/path/anywhere", (r) ->
+        got.done = true
+
+        r match
+            Ok(_) -> got.code = 1
+            Err(e) -> got.code = e.code, O_RDONLY, 0, lp).expect("the open started")
+
+    assert(!got.done, "not before the loop runs")
+
+    lp.run().expect("the loop ran")
+    assert_eq(got.code, ENOENT)

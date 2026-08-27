@@ -389,6 +389,30 @@ readlink_sync(path: string) -> Result[string, Error]
 
     if code < 0 then Err(Error(code)) else Ok(out)
 
+/** Make a symbolic link at `path` pointing at `to`. The target need not exist. */
+symlink_sync(to: string, path: string, flags: i32 = 0) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val a = cstring(to)
+    val b = cstring(path)
+    val code = c.fs_symlink(default_loop().raw(), r, a.ptr, b.ptr, flags, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
+/** Make a hard link at `path` to the file `to` names. Both are the same file afterwards, and
+ * removing one leaves the other.
+ */
+link_sync(to: string, path: string) -> Result[unit, Error]
+    var req: [c.FS_WORDS]u64 = [0; c.FS_WORDS]
+    val r: *c.Fs = ptr_cast(&req[0])
+    val a = cstring(to)
+    val b = cstring(path)
+    val code = c.fs_link(default_loop().raw(), r, a.ptr, b.ptr, null)
+
+    c.fs_req_cleanup(r)
+    checked(code)
+
 /** A directory made from a template whose last six characters are `XXXXXX`, answering the name it
  * ended up with. What a program uses instead of inventing a temporary path and racing.
  */

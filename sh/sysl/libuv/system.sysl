@@ -24,6 +24,11 @@ version() -> u32 = c.version()
  *
  * **This is the one to measure with.** It never goes backwards and is not affected by the system
  * clock being set, which is what makes a difference between two readings meaningful.
+ *
+ * **Only a difference between two readings of THIS call means anything.** It does not share a base
+ * with `clock(CLOCK_MONOTONIC)` -- measured on macOS, where the two are seven seconds apart because
+ * one counts the time the machine spent asleep and the other does not -- so the two must never be
+ * subtracted from each other.
  */
 hrtime() -> u64 = c.hrtime()
 
@@ -43,7 +48,12 @@ time_of_day() -> Result[(i64, i32), Error]
 
     if r < 0 then Err(Error(r)) else Ok((tv.tv_sec, tv.tv_usec))
 
-/** A clock by name -- `CLOCK_MONOTONIC` or `CLOCK_REALTIME` -- in seconds and nanoseconds. */
+/** A clock by name -- `CLOCK_MONOTONIC` or `CLOCK_REALTIME` -- in seconds and nanoseconds.
+ *
+ * `CLOCK_MONOTONIC` here is **not the same base as `hrtime`**, so pick one and stay with it; what
+ * this one buys over `hrtime` is that it is seconds and nanoseconds rather than a single count, and
+ * that `CLOCK_REALTIME` is the wall clock at nanosecond resolution.
+ */
 clock(id: i32 = CLOCK_MONOTONIC) -> Result[(i64, i32), Error]
     var ts = c.Timespec64(0, 0)
     val r = c.clock_gettime(id, &ts)

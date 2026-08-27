@@ -80,6 +80,9 @@ impl Stream for Tty
  *
  * `EINVAL` for a descriptor that is not a terminal, which is what happens when the program's output
  * is a pipe. `guess_handle` is the way to ask first.
+ *
+ * **libuv owns the descriptor afterwards** and closes it when the handle closes, so a program that
+ * opened it must not close it again -- `EBADF` is what the second close answers.
  */
 tty(fd: i32, lp: &Loop = default_loop()) -> Result[&Tty, Error]
     var t: &Tty = Tty([0; c.TTY_WORDS], lp, None, fresh_stream_state(), noop)
