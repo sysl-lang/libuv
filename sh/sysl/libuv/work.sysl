@@ -1,0 +1,160 @@
+// Somewhere to put work that is too slow for the loop.
+//
+// A loop is one thread, and everything on it takes turns. A callback that hashes a password,
+// compresses an asset or reads a file the slow way is a callback nothing else runs during -- so
+// libuv keeps a pool of threads beside the loop, and `queue` is how a job gets onto one.
+//
+//     var out: &sync Digest = Digest([0; 32])
+//
+//     queue(() -> hash_into(out), (r) -> r match
+//         Ok(_) -> print(out.bytes[0])
+//         Err(e) -> print(s"the job did not run: $e"))?
+//
+// **Two callbacks, on two threads.** The job runs on a pool thread; the completion runs back on the
+// loop's, in its turn, like every other callback in this package. That split is what the whole
+// design is about, and it is the reason the two are typed differently.
+//
+// ## What a job may capture
+//
+// **A `&sync Fn` is a closure two threads may hold, so everything it captures has to be countable
+// atomically** -- and the compiler is what says so, at the closure rather than at run time:
+//
+//     var c: &Cell = Cell(1)
+//
+//     queue(() -> print(c.n), on_done)?
+//
+//     error: a closure shared between two domains may be called from either, so every count it
+//     captures has to be atomic -- but the 'c' it captures reaches a '&Cell', whose count is not.
+//     Hold it as a '&sync Cell'
+//
+// So what a job may reach is: **scalars and arrays**, which are copied into it; **`&sync T`**, which
+// is the way to share something both threads touch; and **`*T`**, which carries no count and asks
+// the writer to have thought about it. A `string`, a slice and an ordinary `&T` are refused, and the
+// refusal names which capture it was.
+//
+// **A `&sync T` makes the reference safe to share, not the object safe to mutate.** Two jobs on the
+// pool writing one `&sync` struct race exactly as they would in C; what the type buys is that the
+// box itself is not torn apart underneath them. `sysl.sync.Atomic[T]` and `sysl.posix.threads.Mutex`
+// are what order the writes.
+//
+// **The completion callback is an ordinary closure**, because it runs on the loop's thread and
+// crosses nothing. That is where a job's answer is read and where it is handed to whatever asked
+// for it.
+//
+// ## How big the pool is
+//
+// Four threads, unless `UV_THREADPOOL_SIZE` says otherwise -- and libuv reads that **once**, the
+// first time anything uses the pool, which includes `resolve` and every file operation given a
+// callback. There is no call here that sets it, and the reason is the rule about an API that has to
+// be first: a library function cannot promise what the program did before it, so a `set_pool_size`
+// would be a promise this package is not in a position to make. A program that wants a different
+// pool sets the variable in its environment before it starts.
+//
+// **The pool is shared**, so a job that blocks for a second is a second in which one of the four
+// threads resolves no names and reads no files.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+
+// The job a request carries once it has run: something has to be in the field, and a closure that
+// does nothing is cheaper to call than an `Option` is to test. It is the `&sync` counterpart of
+// `noop` beside it, and it exists for the same reason.
+private sync_noop() -> unit = ()
+
+private ignore_outcome(r: Result[unit, Error]) -> unit = ()
+
+/** A job that has been handed to the thread pool.
+ *
+ * **It is a request rather than a handle**, which is libuv's own distinction and matters here: a
+ * request is one operation with an end, so there is no `close` and nothing to keep alive
+ * afterwards. Like a handle it holds a reference to itself while it is in flight, so a program need
+ * not bind the result of `queue` to a name for the job to run.
+ */
+struct Work
+    private storage: [c.WORK_WORDS]u64
+    private lp: &Loop
+    private me: Option[&Work]
+    private job: &sync Fn() -> unit
+    private on_done: &Fn(Result[unit, Error]) -> unit
+
+    private req(*self) -> *c.Work = ptr_cast(&self.storage[0])
+
+    /** The loop the completion callback will run on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Whether the job is still the loop's business -- queued, running, or waiting to report.
+     *
+     * It answers `false` from the moment the completion callback is entered, which is what makes it
+     * the guard `cancel` needs.
+     */
+    is_pending(self) -> bool = self.me.is_some()
+
+    /** Ask for the job not to run.
+     *
+     * **Only a job that has not started can be cancelled**, and libuv says so with `EBUSY` for one
+     * already on a thread. A cancelled job's completion callback still runs, on the loop, with
+     * `ECANCELED` -- so a program has one place to release whatever the job was holding whichever
+     * way it went.
+     *
+     * `EINVAL` for a request that has already reported. That check is this side's rather than
+     * libuv's: `uv_cancel` on a finished request reads storage libuv has done with, and faults
+     * rather than answering.
+     */
+    cancel(*self) -> Result[unit, Error]
+        if !self.is_pending() then return Err(Error(EINVAL))
+
+        checked(c.cancel(ptr_cast(self.req())))
+end Work
+
+// Called on a pool thread, and the only place in this package where sysl runs anywhere but the
+// loop's own thread. It reads one field and calls it; everything else the request holds belongs to
+// the loop, and touching it here would be the race the `&sync` on that field exists to rule out.
+private work_run(req: *c.Work) -> unit
+    val w: *Work = ptr_cast(c.req_get_data(ptr_cast(req)))
+
+    w.job()
+
+// Back on the loop's thread. Drops both callbacks and the request's reference to itself before
+// calling out, exactly as a handle's close does -- the self-reference may be the last one, so the
+// callback is read into a local first.
+private work_done(req: *c.Work, status: i32) -> unit
+    val w: *Work = ptr_cast(c.req_get_data(ptr_cast(req)))
+    val cb = w.on_done
+
+    w.job = sync_noop
+    w.on_done = ignore_outcome
+    w.me = None
+
+    cb(checked(status))
+
+/** Run `job` on one of the loop's worker threads, and call `cb` on the loop's thread when it is
+ * over.
+ *
+ * `Ok` from this call means the job was queued. Whether it ran is what the callback carries:
+ * `Ok(())` for a job that ran to the end, and `Err` with `ECANCELED` for one `cancel` caught before
+ * a thread picked it up.
+ *
+ * **A job answers by writing, not by returning.** Its closure is `() -> unit`, because a value
+ * coming back out of a pool thread would be a value crossing a domain boundary -- which is the same
+ * reason `sysl.posix.threads.Thread.join` does not carry one. What a job has to say it says through
+ * a `&sync` it captured, and the completion callback is where that is read.
+ *
+ * **The job keeps the loop alive while it is queued**, so a program that queues one and calls `run`
+ * gets its completion callback rather than an immediate return.
+ */
+@crossing(job)
+queue(job: &sync Fn() -> unit, cb: &Fn(Result[unit, Error]) -> unit = ignore_outcome,
+      lp: &Loop = default_loop()) -> Result[&Work, Error]
+    var w: &Work = Work([0; c.WORK_WORDS], lp, None, job, cb)
+
+    w.me = Some(w)
+    c.req_set_data(ptr_cast(w.req()), ptr_cast(&*w))
+
+    val r = c.queue_work(lp.raw(), w.req(), &work_run, &work_done)
+
+    if r < 0
+        w.me = None
+        return Err(Error(r))
+
+    Ok(w)

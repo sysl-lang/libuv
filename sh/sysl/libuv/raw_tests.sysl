@@ -9,8 +9,11 @@ module sh.sysl.libuv
 // somebody having exercised it. Everything the layer above uses is covered by the tests beside this
 // one; what is left is covered here, by calling it directly.
 //
-// **`uv_cancel` is the one that is not declared at all**, and the reason is in `c.sysl`: it may only
-// be called on a request still in flight, and on a finished one it segfaults rather than answering.
+// **`uv_cancel` is not among them, and it used to be the one declaration with no caller.** It may
+// only be called on a request still in flight -- on a finished one it reads storage libuv has done
+// with, and faults rather than answering -- so there was nothing safe to call it from. `Work.cancel`
+// is that caller now: a request knows whether it is still the loop's, which is the guard the raw
+// declaration could not carry, and `work_tests.sysl` exercises both sides of it.
 
 import sh.sysl.libuv.c
 import sysl.text.cstring

@@ -3,11 +3,11 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       libuv { git = "github.com/sysl-lang/libuv", version = "0.1.1" }
+//       libuv { git = "github.com/sysl-lang/libuv", version = "0.1.2" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.1` on this repository.
+// tag `v0.1.2` on this repository.
 //
 // **libuv has to be installed, and so do its headers.** Nothing is vendored here beyond a small
 // shim: libuv is a large C project with a platform backend per operating system, and a package
@@ -24,7 +24,7 @@
 
 package {
   name    = "libuv"
-  version = "0.1.1"
+  version = "0.1.2"
 
   // **The compiler this was written against and the only one it is known to build with.**
   //

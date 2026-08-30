@@ -1,0 +1,188 @@
+module sh.sysl.libuv
+@tests
+
+// What the thread pool claims, run by `sysl test .`.
+//
+// **The claim under test is that the job is somewhere else.** Everything else in this package runs
+// on one thread, so a `queue` that quietly called its job on the loop would pass any test asking
+// only whether the job ran -- which is why the first case below compares `pthread_self` on the two
+// sides and would go red for exactly that implementation.
+//
+// **The shared state is `&sync` and its counters are atomic**, because these tests are the one place
+// in the package where two threads touch one object. A plain `int` incremented by thirty-two pool
+// threads is the race the type system refuses to let a job capture at all.
+
+import sysl.posix.threads.{current, yield_now}
+import sysl.sync.Atomic
+
+// What both threads touch. Every field is atomic, and the struct is reached as a `&sync` -- which is
+// what a job is allowed to capture, and the whole subject of `work.sysl`'s prose.
+private struct Shared
+    ran: Atomic[int]
+    worker: Atomic[usize]
+    gate: Atomic[int]
+    started: Atomic[int]
+
+private shared() -> &sync Shared = Shared(Atomic(0), Atomic(0), Atomic(0), Atomic(0))
+
+// What only the loop's thread touches: an ordinary `&T`, since a completion callback crosses
+// nothing.
+private struct Report
+    n: int
+    on_thread: usize
+    code: i32
+
+    note(*self, r: Result[unit, Error])
+        self.n += 1
+        self.on_thread = current().id
+        self.code = r match
+            Ok(_) -> 0
+            Err(e) -> e.code
+
+private report() -> &Report = Report(0, 0, 0)
+
+// -- The job is somewhere else --------------------------------------------------------------------
+
+@test("a job runs on a pool thread and its completion runs on the loop's")
+work_crosses_and_comes_back()
+    val lp = default_loop()
+    val s = shared()
+    val r = report()
+    val here = current().id
+
+    val w = queue(() ->
+        s.worker.store(current().id)
+        s.ran.add(1), (out) -> r.note(out), lp).expect("queued")
+
+    assert(usize(&*w.on_loop()) == usize(&*lp), "the request knows the loop it will answer on")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(s.ran.load(), 1)
+    assert_eq(r.n, 1)
+    assert_eq(r.code, 0)
+    assert_eq(r.on_thread, here)
+    assert(s.worker.load() != here, "the job did not run on the loop's thread")
+
+@test("a queued job is what the loop waits for")
+work_holds_the_loop()
+    val lp = default_loop()
+    val r = report()
+
+    // Nothing else is open, so a loop that did not count the request would return with the
+    // completion callback unrun.
+    queue(() -> (), (out) -> r.note(out), lp).expect("queued")
+
+    assert(!lp.run().unwrap(), "and nothing is left afterwards")
+    assert_eq(r.n, 1)
+
+@test("every job in a batch runs, and none of the counts are lost")
+work_batch()
+    val lp = default_loop()
+    val s = shared()
+    val r = report()
+
+    for i in 0..<32
+        queue(() -> s.ran.add(1), (out) -> r.note(out), lp).expect("queued")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(s.ran.load(), 32)
+    assert_eq(r.n, 32)
+
+@test("a job may reach a raw pointer, which carries no count for the crossing rule to be about")
+work_captures_a_pointer()
+    val lp = default_loop()
+    val r = report()
+    var answer = 0
+
+    // A `*T` is on the crossable list because *it* has no refcount -- which says nothing about what
+    // is at the far end, and is why the annotation on `queue` looks through one. The frame holding
+    // `answer` outlives the job, because `run` below does not return until the job has reported.
+    val p = &answer
+
+    queue(() -> p[0] = 41 + 1, (out) -> r.note(out), lp).expect("queued")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(r.n, 1)
+    assert_eq(answer, 42)
+
+// -- Cancelling -----------------------------------------------------------------------------------
+
+@test("a job cancelled before a thread reaches it does not run, and reports ECANCELED")
+work_cancel()
+    val lp = default_loop()
+    val s = shared()
+    val r = report()
+
+    // The pool is four threads unless the environment says otherwise, and the queue is served in
+    // order -- so with sixty-four jobs parked on the gate ahead of it, the victim below cannot have
+    // been picked up by the time `cancel` is called.
+    for i in 0..<64
+        queue(() ->
+            while s.gate.load() == 0
+                yield_now()
+
+            s.ran.add(1), noop_outcome, lp).expect("queued")
+
+    val victim = queue(() -> s.ran.add(1000), (out) -> r.note(out), lp).expect("queued")
+
+    assert(victim.is_pending(), "the request is the loop's until it reports")
+    victim.cancel().expect("a job that has not started can be cancelled")
+
+    s.gate.store(1)
+    lp.run().expect("the loop ran")
+
+    assert_eq(r.n, 1)
+    assert_eq(r.code, ECANCELED)
+    assert_eq(s.ran.load(), 64)
+    assert(!victim.is_pending(), "and it is not pending once it has reported")
+
+@test("a job a thread has already picked up cannot be cancelled, and libuv says which")
+work_cancel_running()
+    val lp = default_loop()
+    val s = shared()
+    val r = report()
+
+    // It parks on the gate, so it is provably still running when `cancel` is called below -- the
+    // main thread does not move on until the job itself says it has started.
+    val running = queue(() ->
+        s.started.store(1)
+
+        while s.gate.load() == 0
+            yield_now()
+
+        s.ran.add(1), (out) -> r.note(out), lp).expect("queued")
+
+    while s.started.load() == 0
+        yield_now()
+
+    running.cancel() match
+        Ok(_) -> assert(false, "a job on a thread cannot be called back")
+        Err(e) -> assert_eq(e.code, EBUSY)
+
+    s.gate.store(1)
+    lp.run().expect("the loop ran")
+
+    assert_eq(s.ran.load(), 1)
+    assert_eq(r.n, 1)
+    assert_eq(r.code, 0, "and it finished normally, cancel having done nothing")
+
+@test("cancelling a job that has already reported is refused rather than faulting")
+work_cancel_after_the_fact()
+    val lp = default_loop()
+    val r = report()
+    val w = queue(() -> (), (out) -> r.note(out), lp).expect("queued")
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(r.n, 1)
+    assert(!w.is_pending(), "the request is finished")
+
+    // libuv's own `uv_cancel` reads storage it has done with here; this is the guard above it.
+    w.cancel() match
+        Ok(_) -> assert(false, "a finished request cannot be cancelled")
+        Err(e) -> assert_eq(e.code, EINVAL)
+
+private noop_outcome(r: Result[unit, Error]) -> unit = ()

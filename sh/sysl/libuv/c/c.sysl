@@ -59,6 +59,7 @@ opaque struct Connect
 opaque struct Shutdown
 opaque struct Fs
 opaque struct GetAddrInfo
+opaque struct Work
 
 // `uv_buf_t`, whose two fields swap places between Unix and Windows. It is reached through the shim
 // rather than declared, and this is the type of the storage that holds one.
@@ -193,6 +194,19 @@ extern "uv_req_get_type" req_get_type(r: *Req) -> i32
 extern "uv_req_type_name" req_type_name(kind: i32) -> *u8
 extern "uv_req_get_data" req_get_data(r: *Req) -> *u8
 extern "uv_req_set_data" req_set_data(r: *Req, data: *u8)
+
+// ## The thread pool
+//
+// The one way into libuv's own worker threads. `work_cb` is called on a pool thread and
+// `after_work_cb` back on the loop's, which is what makes the pair a boundary between two
+// concurrency domains rather than two callbacks.
+//
+// The pool is shared by everything libuv runs on it — `getaddrinfo`, the file operations given a
+// callback, and this — so a job that blocks for a second is a second nothing else on the pool
+// starts in.
+
+extern "uv_queue_work" queue_work(l: *Loop, req: *Work, work_cb: *extern(*Work) -> unit,
+                                  after_work_cb: *extern(*Work, i32) -> unit) -> i32
 
 // ## Timer
 
@@ -463,6 +477,7 @@ c const
     SHUTDOWN_WORDS: usize = "(sizeof(uv_shutdown_t) + 7) / 8"
     FS_WORDS: usize = "(sizeof(uv_fs_t) + 7) / 8"
     GETADDRINFO_WORDS: usize = "(sizeof(uv_getaddrinfo_t) + 7) / 8"
+    WORK_WORDS: usize = "(sizeof(uv_work_t) + 7) / 8"
 
     BUF_WORDS: usize = "(sizeof(uv_buf_t) + 7) / 8"
     SOCKADDR_WORDS: usize = "(sizeof(struct sockaddr_storage) + 7) / 8"

@@ -172,15 +172,63 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **pipes** | `pipe`, `pipe_pair`, `socket_pair`, and Unix domain sockets |
 | **terminals** | `tty`, `set_mode`, `winsize`, `reset_tty_mode`, `guess_handle` |
 | **names** | `resolve` — `getaddrinfo` on the thread pool |
+| **the pool** | `queue` — a job on a worker thread, answered on the loop; `cancel`, `is_pending` |
 | **files, blocking** | `open_sync`, `read_file_sync`, `write_file_sync`, `stat_sync`, `scandir_sync`, `symlink_sync`, … |
 | **files, not** | `open`, `read`, `write`, `stat`, `scandir`, `read_file`, … |
 | **children** | `spawn`, `Stdio`, `kill`, `on_exit` |
 | **the machine** | `hrtime`, `hostname`, `cwd`, `env`, `available_parallelism`, memory, load |
 
 **What is not bound yet**, and is ordinary work rather than anything blocked: UDP, `uv_poll_t`,
-`uv_fs_event_t` and `uv_fs_poll_t`, the work queue (`uv_queue_work`), `getnameinfo`, `uv_random`,
-threads and the locks that go with them, and `dlopen`. Each is a section of `uv.h` and each would be
-added the way the ones above were.
+`uv_fs_event_t` and `uv_fs_poll_t`, `getnameinfo`, `uv_random`, threads and the locks that go with
+them, and `dlopen`. Each is a section of `uv.h` and each would be added the way the ones above were.
+libuv's own threads and mutexes are the one entry there that a program need not wait for:
+`sysl.posix.threads` and `sysl.sync` already have both.
+
+## Work that is too slow for the loop
+
+A loop is one thread and everything on it takes turns, so a callback that hashes a password or
+compresses an asset is a callback nothing else runs during. `queue` puts the slow part on one of
+libuv's worker threads and answers back on the loop:
+
+```sysl
+var out: &sync Digest = Digest([0; 32])
+
+queue(() -> hash_into(out), (r) -> r match             // the job, then the answer
+    Ok(_) -> reply(out)
+    Err(e) -> print(s"the job did not run: $e"))?
+```
+
+**Two callbacks on two threads, and only one of them is ordinary.** The completion runs on the loop
+and captures what any other callback here captures. The job crosses a concurrency domain, so it is a
+`&sync Fn` — and **the compiler is what holds a caller to that**, at the closure rather than at run
+time:
+
+```
+error: a closure shared between two domains may be called from either, so every count it captures
+has to be atomic — but the 'c' it captures reaches a '&Cell', whose count is not. Hold it as a
+'&sync Cell'
+```
+
+So a job may reach scalars and arrays, which are copied into it; a `&sync T`, which is how two
+threads share one object; and a `*T`, which carries no count and asks the writer to have thought
+about it. A `string`, a slice and an ordinary `&T` are refused, and the refusal names the capture.
+**A `&sync T` makes the reference safe to share, not the object safe to mutate** — that still wants
+`sysl.sync.Atomic` or a mutex.
+
+**A job answers by writing rather than by returning.** Its closure is `() -> unit`, because a value
+coming back out of a pool thread would be a value crossing a boundary; what it has to say it says
+through the `&sync` it captured, and the completion callback is where that is read.
+
+**`cancel` catches a job a thread has not reached yet**, and `EBUSY` says one already running cannot
+be. Either way the completion callback runs — with `ECANCELED` for a cancelled job — so a program
+has one place to release what the job was holding.
+
+**The pool is four threads unless `UV_THREADPOOL_SIZE` says otherwise, and libuv reads that once**,
+at first use — which `resolve` and every asynchronous file call also count as. There is no call here
+that sets it: a library function cannot promise what the program did before it, so that is a variable
+a program's environment carries rather than a function this package could honestly offer. The pool is
+also **shared**, so a job that blocks for a second is a second in which one of those four threads
+resolves no names and reads no files.
 
 ## The file system, both ways round
 
@@ -246,20 +294,22 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and fourteen of them, over six files, and every public entry point but one is exercised
+**A hundred and twenty-one of them, over seven files, and every public entry point but one is exercised
 by one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
 macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
 binding, and a test runner has no controlling terminal to use instead. It says so at the site.
 
 **The whole raw layer is exercised too**, which is a separate file: a declaration nothing calls is a
 declaration nothing checks, and a signature that disagrees with `uv.h` links perfectly and corrupts
-the call at run time. Every one of the 182 `extern`s is now reached, from the pleasant layer or from
-`raw_tests.sysl` directly. `uv_cancel` was deleted rather than tested — it may only be called on a
-request still in flight, and on a finished one it segfaults, so a declaration with no safe caller was
-worse than none.
+the call at run time. Every one of the 184 `extern`s is now reached, from the pleasant layer or from
+`raw_tests.sysl` directly. `uv_cancel` was the one exception until the thread pool arrived — it may
+only be called on a request still in flight, and on a finished one it faults, so there was nothing
+safe to call it from. `Work.cancel` is that caller now, because a request knows whether it is still
+the loop's.
 
 **The most important test is the one that watches memory.** A handle holds a reference to itself so
-that the loop owns it, and `close` dropping that is what the whole design rests on — but a refcount
+that the loop owns it, and `close` dropping that is what the whole design rests on — as does a work
+request, which has no close and releases itself when it reports instead — but a refcount
 is not something a program can ask about, so a `finish_close` missing one line would leak every
 handle a program ever opened with every other test still green. `closing_frees` churns ten thousand
 of each handle type per round and asserts resident memory stops growing once the allocator has

@@ -449,6 +449,11 @@ loop_fork()
 // every other test still green. Each handle type writes its own `finish_close`, so each is churned
 // here rather than one standing for the rest.
 //
+// **A work request is churned beside them**, because it makes the same claim by a different route: a
+// `Work` holds a reference to itself from `queue` until its completion callback, and what releases it
+// is `work_done` rather than a close. There is nothing for a caller to close, so a line missing there
+// leaks a request per job with no other symptom at all.
+//
 // **Resident memory is the only observer available**, since a refcount is not something a program
 // can ask about. It is blunt but it discriminates: with the self-reference cleared the first round
 // claims pages from the allocator and every round after it grows by nothing, and with one line
@@ -457,7 +462,7 @@ loop_fork()
 //
 // The first round is a warm-up for exactly that reason: what is asserted is the growth *after* the
 // allocator has settled.
-@test("closing a handle releases it, for every kind of handle there is")
+@test("closing a handle releases it, for every kind of handle there is, and a finished job too")
 closing_frees()
     val lp = default_loop()
 
@@ -475,6 +480,10 @@ closing_frees()
     // nothing at all. A mebibyte is far below the first and far above the second.
     assert(grew < 1048576, "closed handles were freed rather than kept")
 
+private work_nothing() -> unit = ()
+
+private ignore_work(r: Result[unit, Error]) -> unit = ()
+
 private churn(lp: &Loop)
     val cheap = 10000
     val sockets = 2000
@@ -490,6 +499,11 @@ private churn(lp: &Loop)
     for i in 0..<sockets
         tcp(lp).expect("a socket").close()
         pipe(false, lp).expect("a pipe").close()
+
+    // Not closed, because a request is not a handle: what releases one is reporting, which the
+    // `run` below is what makes happen.
+    for i in 0..<sockets
+        queue(work_nothing, ignore_work, lp).expect("a job")
 
     // The close callbacks run on the next turn, which is what actually releases each handle.
     lp.run().expect("the loop ran")
