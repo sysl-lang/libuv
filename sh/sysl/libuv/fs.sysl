@@ -205,7 +205,9 @@ private stat_of(s: *c.Stat) -> Stat
 // -- The blocking half ------------------------------------------------------------------------
 
 /** Open a file. `flags` is the `O_*` constants ored together, and `mode` is the permission bits a
- * newly created file gets -- 0o644 written out, since sysl has no octal literal for it.
+ * newly created file gets. The default is 0o644, spelled with the named constants rather than as
+ * a literal because those are the platform's own -- the bits behind `S_IRUSR` are not sysl's to
+ * promise. (An earlier version of this comment said sysl had no octal literal; it always has.)
  *
  *     val f = open_sync("notes.txt", O_WRONLY | O_CREAT | O_TRUNC)?
  */
