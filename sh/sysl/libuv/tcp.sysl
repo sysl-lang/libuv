@@ -49,7 +49,19 @@ struct Tcp
      * server reports rather than crashes on.
      *
      * A port of `0` asks the kernel to pick one, and `sockname` is how to find out which.
-     * `TCP_IPV6ONLY` is the one flag, and only means anything for a v6 address.
+     *
+     * **Two flags, and they are `TCP_IPV6ONLY` and `TCP_REUSEPORT`.** The first binds the v6 address
+     * alone and means nothing for a v4 one. The second asks the kernel to let several listeners hold
+     * the same port and to distribute connections across them, which is how a server uses every core
+     * without one thread accepting for all of them:
+     *
+     *     server.bind(ip4("0.0.0.0", 8080)?, TCP_REUSEPORT)?
+     *
+     * **`TCP_REUSEPORT` answers `ENOTSUP` where the kernel does not distribute**, which includes
+     * macOS -- so it is a failure to handle rather than a flag to set unconditionally. A server that
+     * wants the port either way binds without it when the first attempt is refused, and one that
+     * needs the load balancing reports that it cannot have it. `constants.sysl` has the platform list
+     * and says why macOS is refused rather than merely absent.
      */
     bind(*self, addr: Address, flags: u32 = 0) -> Result[unit, Error]
         var a = addr

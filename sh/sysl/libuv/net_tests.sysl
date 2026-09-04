@@ -397,3 +397,69 @@ resetting_the_terminal()
     // It is the process's terminal rather than any handle's, so this is what a program calls on the
     // way out -- including the way out of a failure, where nothing may have been set at all.
     reset_tty_mode().expect("reset")
+
+// -- The two bind flags ----------------------------------------------------------------------------
+
+@test("without REUSEPORT a second listener on the same port is refused")
+bind_without_reuseport()
+    // The control, and the reason the case below means anything: a port is one listener's by
+    // default, everywhere, and that is what `TCP_REUSEPORT` asks the kernel to relax.
+    val lp = new_loop().expect("a loop")
+    val first = tcp(lp).expect("a socket")
+
+    first.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+    first.listen(4, () -> ()).expect("listening")
+
+    val where = first.sockname().expect("the port")
+    val second = tcp(lp).expect("a socket")
+
+    // `SO_REUSEADDR` is set by libuv for every listener, so this is not a `TIME_WAIT` question --
+    // the first socket is listening right now and the port is taken.
+    second.bind(where) match
+        Ok(_) -> assert(second.listen(4, () -> ()).is_err(), "a second listener was allowed")
+        Err(e) -> assert_eq(e.code, EADDRINUSE)
+
+    first.close()
+    second.close()
+    lp.run().expect("the loop drained")
+end bind_without_reuseport
+
+@test("REUSEPORT either shares the port or says the kernel will not")
+bind_with_reuseport()
+    // **Two answers are correct and which one arrives is the platform's**, so this asserts the pair
+    // rather than either: on Linux and the BSDs that distribute connections, both binds succeed and
+    // both listeners are real; everywhere else -- macOS included, and deliberately -- libuv refuses
+    // the flag with `ENOTSUP` rather than binding a socket that would not be load balanced.
+    //
+    // What it rules out is the third answer, which is the one that would be a defect: a bind that
+    // reports success on a platform where the flag does nothing, leaving a server believing it has
+    // a share of the port.
+    val lp = new_loop().expect("a loop")
+    val first = tcp(lp).expect("a socket")
+
+    first.bind(ip4("127.0.0.1", 0).expect("an address"), TCP_REUSEPORT) match
+        Err(e) ->
+            assert_eq(e.code, ENOTSUP)
+            first.close()
+        Ok(_) ->
+            first.listen(4, () -> ()).expect("listening")
+
+            val where = first.sockname().expect("the port")
+            val second = tcp(lp).expect("a socket")
+
+            second.bind(where, TCP_REUSEPORT).expect("the port is shared")
+            second.listen(4, () -> ()).expect("the second listener is real")
+
+            first.close()
+            second.close()
+
+    lp.run().expect("the loop drained")
+end bind_with_reuseport
+
+@test("the flags are the numbers libuv's own header gives them")
+bind_flag_values()
+    // A `c const` is read from the header, so this is not transcription -- what it pins is that the
+    // two flags are distinct and combinable, which is what a caller passing `a | b` depends on.
+    assert_eq(TCP_IPV6ONLY, 1)
+    assert_eq(TCP_REUSEPORT, 2)
+    assert_eq(TCP_IPV6ONLY | TCP_REUSEPORT, 3)

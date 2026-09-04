@@ -157,10 +157,30 @@ c const
     AI_NUMERICSERV: i32 = "AI_NUMERICSERV"
     AI_ADDRCONFIG: i32 = "AI_ADDRCONFIG"
 
-// Bind to the v6 address only, rather than to the v4-mapped range as well. The one flag `bind`
-// takes.
+// ## The two flags `bind` takes
+//
+// `TCP_IPV6ONLY` binds the v6 address only, rather than the v4-mapped range as well, and means
+// nothing for a v4 address.
+//
+// **`TCP_REUSEPORT` is `SO_REUSEPORT`, and it is not the option with a similar name.** It allows
+// several processes or threads to bind the same port at once and has the *kernel* distribute
+// incoming connections across the listeners -- which is how a server uses every core without a
+// thread handing accepted sockets to the others. `SO_REUSEADDR`, which libuv sets for every listener
+// on its own and offers no flag for, is the unrelated option that lets a port be rebound while the
+// last connection on it is still in `TIME_WAIT`.
+//
+// **It is refused where the kernel does not distribute**, rather than silently doing something else:
+// libuv answers `ENOTSUP` from `bind` on every platform but Linux 3.9+, DragonFly 3.6+, FreeBSD
+// 12.0+, Solaris 11.4 and AIX 7.2.5+. **macOS is not on that list**, and that is a deliberate refusal
+// rather than an omission -- its `SO_REUSEPORT` lets the duplicate bind succeed and then delivers
+// every connection to the *last* socket bound, which is not load balancing and is a trap for anybody
+// who tested on a Mac and shipped to Linux.
+//
+// **It needs libuv 1.49 or newer**, which is where the flag was added. An older libuv fails to
+// compile this file, naming the identifier.
 c const
     TCP_IPV6ONLY: u32 = "UV_TCP_IPV6ONLY"
+    TCP_REUSEPORT: u32 = "UV_TCP_REUSEPORT"
 
 // ## Readable and writable
 //

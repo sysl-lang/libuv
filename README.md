@@ -5,7 +5,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.1" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.3" }
 }
 ```
 
@@ -168,7 +168,7 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **wake-ups** | `notifier` — the one handle another thread may touch |
 | **signals** | `signal`, `start`, `start_once`, `kill`, `ignore_sigpipe` |
 | **streams** | `read_start`, `write`, `try_write`, `shutdown`, `listen`, back-pressure |
-| **TCP** | `tcp`, `bind`, `listen`, `accept`, `connect`, `nodelay`, `keepalive`, `sockname` |
+| **TCP** | `tcp`, `bind` (with `TCP_IPV6ONLY` and `TCP_REUSEPORT`), `listen`, `accept`, `connect`, `nodelay`, `keepalive`, `sockname` |
 | **pipes** | `pipe`, `pipe_pair`, `socket_pair`, and Unix domain sockets |
 | **terminals** | `tty`, `set_mode`, `winsize`, `reset_tty_mode`, `guess_handle` |
 | **names** | `resolve` — `getaddrinfo` on the thread pool |
@@ -183,6 +183,29 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 them, and `dlopen`. Each is a section of `uv.h` and each would be added the way the ones above were.
 libuv's own threads and mutexes are the one entry there that a program need not wait for:
 `sysl.posix.threads` and `sysl.sync` already have both.
+
+## One port, several listeners
+
+`bind` takes `TCP_REUSEPORT`, which asks the kernel to let more than one socket hold the same port
+and to distribute incoming connections across them:
+
+```sysl
+server.bind(ip4("0.0.0.0", 8080).expect("an address"), TCP_REUSEPORT).expect("bound")
+```
+
+That is how a server uses every core: a process per core, each with its own loop and its own
+listener, and no thread accepting connections on behalf of the others. It is `SO_REUSEPORT` and it
+is **not** `SO_REUSEADDR`, which libuv sets for every listener on its own — that one is about
+rebinding a port whose last connection is still in `TIME_WAIT`, and it distributes nothing.
+
+**It answers `ENOTSUP` where the kernel does not distribute, and macOS is one of those.** The flag
+works on Linux 3.9+, DragonFly 3.6+, FreeBSD 12.0+, Solaris 11.4 and AIX 7.2.5+. macOS is refused on
+purpose rather than by omission: its `SO_REUSEPORT` lets the duplicate bind succeed and then delivers
+every connection to the *last* socket bound, which is not load balancing — so a program developed on
+a Mac and shipped to Linux would have been silently wrong about what it had. A server that wants the
+port either way binds again without the flag when the first attempt is refused.
+
+It needs libuv 1.49 or newer, which is where the flag was added.
 
 ## Work that is too slow for the loop
 
@@ -279,6 +302,10 @@ brew install libuv             # macOS
 sudo apt install libuv1-dev    # Debian / Ubuntu
 sudo pacman -S libuv           # Arch
 ```
+
+**libuv 1.49 or newer**, which is where `UV_TCP_REUSEPORT` was added. An older one fails to compile
+`constants.sysl`, naming that identifier — which reads as a defect in this package and is a libuv
+that predates the flag.
 
 The build needs no flags: `libuv.pc` is installed beside the library everywhere it ships, and the
 manifest's `pkg_config` requirement asks for it. `--include-path libuv=<dir>` and `--link-path <dir>`
