@@ -5,7 +5,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.3" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.4" }
 }
 ```
 
@@ -169,7 +169,7 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **signals** | `signal`, `start`, `start_once`, `kill`, `ignore_sigpipe` |
 | **streams** | `read_start`, `write`, `try_write`, `shutdown`, `listen`, back-pressure |
 | **TCP** | `tcp`, `bind` (with `TCP_IPV6ONLY` and `TCP_REUSEPORT`), `listen`, `accept`, `connect`, `nodelay`, `keepalive`, `sockname` |
-| **pipes** | `pipe`, `pipe_pair`, `socket_pair`, and Unix domain sockets |
+| **pipes** | `pipe`, `pipe_pair`, `socket_pair`, Unix domain sockets, and `write_handle` / `pending_count` / `pending_type` / `accept_pending` for passing a handle |
 | **terminals** | `tty`, `set_mode`, `winsize`, `reset_tty_mode`, `guess_handle` |
 | **names** | `resolve` — `getaddrinfo` on the thread pool |
 | **the pool** | `queue` — a job on a worker thread, answered on the loop; `cancel`, `is_pending` |
@@ -206,6 +206,59 @@ a Mac and shipped to Linux would have been silently wrong about what it had. A s
 port either way binds again without the flag when the first attempt is refused.
 
 It needs libuv 1.49 or newer, which is where the flag was added.
+
+## One listener, several processes — passing a handle
+
+**Where `TCP_REUSEPORT` is refused, the portable answer is to move the socket rather than the
+listener**, and that is what an ipc pipe is for: a supervisor owns the one listener, accepts every
+connection itself, and hands each accepted socket to a worker over the pipe it spawned that worker
+with. It is Node's cluster module's default scheduler, and it is the same mechanism underneath —
+`SCM_RIGHTS` over a Unix domain socket, with libuv doing the `sendmsg`.
+
+The channel is a `stdio` slot, and `stdio` is not limited to three:
+
+```sysl
+val to_worker = pipe(true)?
+
+spawn(exe, ["--worker"], on_exit,
+      [Inherit, Inherit, Inherit, ToPipe(to_worker, READABLE_PIPE | WRITABLE_PIPE)])?
+```
+
+Slot `i` is the child's descriptor `i`, so the worker's end is fd 3 and it adopts it with
+`pipe(true)?.open(3)`. Both ends must be made with `pipe(true)`.
+
+Sending is one call, and **the payload is never empty** — a handle travels attached to bytes, and a
+single byte is the usual one. What is in it is the supervisor's business; libuv does not look:
+
+```sysl
+to_worker.write_handle([1], conn, (r) ->
+    r.expect("sent")
+    conn.close())?
+```
+
+**The handle is duplicated, not moved.** The descriptor is copied when libuv reaches the `sendmsg`,
+which is why `conn` has to stay open until the write callback and why this side still closes its own
+copy afterwards.
+
+Receiving happens **inside the read callback**, which is the only place a pending handle exists:
+
+```sysl
+from_supervisor.read_start((r) -> r match
+    Data(_) ->
+        if from_supervisor.pending_count() > 0 && from_supervisor.pending_type() == HANDLE_TCP
+            val conn = tcp()?
+
+            from_supervisor.accept_pending(conn)?
+            serve(conn)
+    End -> ...
+    Failed(e) -> ...)
+```
+
+`pending_type` has to be asked before the handle is taken, because `accept_pending` puts it into
+whatever handle it is given and only the type says which kind that should be — `HANDLE_TCP` for a
+socket, `HANDLE_NAMED_PIPE` for a pipe or a Unix domain socket. `accept_pending` with nothing waiting
+is `EAGAIN`; `write_handle` on a pipe that was not made with `ipc` is `EINVAL`, which is libuv's own
+refusal rather than a check this package added.
 
 ## Work that is too slow for the loop
 
@@ -321,14 +374,14 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and twenty-one of them, over seven files, and every public entry point but one is exercised
+**A hundred and twenty-eight of them, over seven files, and every public entry point but one is exercised
 by one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
 macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
 binding, and a test runner has no controlling terminal to use instead. It says so at the site.
 
 **The whole raw layer is exercised too**, which is a separate file: a declaration nothing calls is a
 declaration nothing checks, and a signature that disagrees with `uv.h` links perfectly and corrupts
-the call at run time. Every one of the 184 `extern`s is now reached, from the pleasant layer or from
+the call at run time. Every one of the 187 `extern`s is now reached, from the pleasant layer or from
 `raw_tests.sysl` directly. `uv_cancel` was the one exception until the thread pool arrived — it may
 only be called on a request still in flight, and on a finished one it faults, so there was nothing
 safe to call it from. `Work.cancel` is that caller now, because a request knows whether it is still

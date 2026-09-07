@@ -15,10 +15,47 @@
 //
 // The other use is talking to a child process, which is what `ipc` is for: a pipe created with it
 // can carry a handle as well as bytes, which is how a parent hands a listening socket to a worker.
+//
+// ## Passing a handle
+//
+// **An ipc pipe carries handles as well as bytes**, and that is the portable way to spread
+// connections over several processes: `TCP_REUSEPORT` is refused on macOS, so a supervisor accepts
+// every connection itself and hands each accepted socket to a worker over the pipe it spawned that
+// worker with. It is what Node's cluster module does by default, and it is the same mechanism --
+// `SCM_RIGHTS` over a Unix domain socket -- with libuv doing the `sendmsg`.
+//
+// The sending side is one call:
+//
+//     val conn = server.accept()?               // the supervisor's accepted socket
+//
+//     to_worker.write_handle([1u8], conn)?      // and the worker now has a copy of it
+//     conn.close()                              // this side is finished with its own
+//
+// **Something has to be written with it**: a handle travels attached to bytes, so the payload is
+// never empty, and a single byte is the usual one. What is in it is the supervisor's business --
+// which worker, which protocol, which request -- and libuv does not look at it.
+//
+// The receiving side takes the handle **from inside the read callback**, which is the only place a
+// pending one is there to take:
+//
+//     from_supervisor.read_start((r) ->
+//         if from_supervisor.pending_count() > 0 && from_supervisor.pending_type() == HANDLE_TCP
+//             val conn = tcp()?
+//
+//             from_supervisor.accept_pending(conn)?
+//             serve(conn))
+//
+// **The type has to be asked for before the handle is taken**, because `accept_pending` needs a
+// handle of the right kind to put it in and only `pending_type` says which that is -- `HANDLE_TCP`
+// for a socket, `HANDLE_NAMED_PIPE` for a pipe or a Unix domain socket.
+//
+// **Both ends must be ipc pipes**, made with `pipe(true)`. `write_handle` on one that is not is
+// refused with `EINVAL`, which is libuv's own answer rather than a check added here.
 
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.slices.as_mut_ptr
 import sysl.text.cstring
 import sysl.text.from_cstring
 
@@ -78,6 +115,68 @@ struct Pipe
      * child was given. **libuv owns it afterwards.**
      */
     open(*self, fd: i32) -> Result[unit, Error] = checked(c.pipe_open(self.raw(), fd))
+
+    /** Queue `bytes` to be written and hand `send` to the peer along with them, calling `cb` when
+     * the write has gone -- or when it failed.
+     *
+     * **This pipe must be an ipc pipe**, made with `pipe(true)`, and so must the peer's end.
+     * Anything else is refused with `EINVAL`, which is libuv's own answer; a pipe that has no
+     * descriptor yet is refused with `EBADF`.
+     *
+     * **The bytes are copied and the handle is not.** What crosses is a duplicate of the
+     * descriptor, so both sides have a working handle afterwards and **this side still has to
+     * close its own** -- passing a handle gives it away in the sense that the peer can use it, not
+     * in the sense that it stops being ours.
+     *
+     * **Something must be written**, since a handle travels attached to bytes; a single byte is the
+     * usual payload and an empty slice is a write with nothing to attach to.
+     */
+    write_handle[S: Stream](*self, bytes: []const u8, send: &S,
+                            cb: &Fn(Result[unit, Error]) -> unit = ignore_status) -> Result[unit, Error]
+        var w: &WriteReq = WriteReq([0; c.WRITE_WORDS], [0; c.BUF_WORDS], copy_of(bytes), None, cb)
+
+        w.me = Some(w)
+        c.buf_set(w.buf(), as_mut_ptr(w.data), w.data.len)
+        c.req_set_data(ptr_cast(w.req()), ptr_cast(&*w))
+
+        val r = c.write2(w.req(), self.stream_ptr(), w.buf(), 1, send.stream_ptr(), &write_done)
+
+        if r < 0
+            w.me = None
+            return Err(Error(r))
+
+        Ok(())
+
+    /** How many handles the peer has sent that have not been taken yet.
+     *
+     * **Only ever asked from inside the read callback**: a pending handle arrives with the bytes it
+     * was attached to and is gone again by the next turn of the loop, so anywhere else this is
+     * zero.
+     */
+    pending_count(*self) -> usize
+        val n = c.pipe_pending_count(self.raw())
+
+        if n < 0 then 0 else usize(n)
+
+    /** What the next pending handle is -- `HANDLE_TCP`, `HANDLE_NAMED_PIPE`, `HANDLE_UDP`, or
+     * `UNKNOWN_HANDLE` when there is none waiting.
+     *
+     * This is what decides which kind of handle to make before `accept_pending`, and there is no
+     * other way to find out: libuv puts the handle into whatever it is given.
+     */
+    pending_type(*self) -> i32 = c.pipe_pending_type(self.raw())
+
+    /** Take the handle the peer sent into `into`, which must be a fresh handle of the kind
+     * `pending_type` named and on this pipe's loop.
+     *
+     * **Called from inside the read callback**, once per pending handle. `EAGAIN` where there is
+     * none waiting, which is what a receiver that did not check `pending_count` gets.
+     *
+     * What `into` becomes is connected and ready: a `Tcp` here is a socket someone else accepted,
+     * with a peer already on the other end of it.
+     */
+    accept_pending[S: Stream](*self, into: &S) -> Result[unit, Error] =
+        checked(c.accept(self.stream_ptr(), into.stream_ptr()))
 
     /** This end's name. */
     sockname(*self) -> Result[string, Error] = self.name_through(true)

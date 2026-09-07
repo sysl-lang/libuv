@@ -463,3 +463,139 @@ bind_flag_values()
     assert_eq(TCP_IPV6ONLY, 1)
     assert_eq(TCP_REUSEPORT, 2)
     assert_eq(TCP_IPV6ONLY | TCP_REUSEPORT, 3)
+
+// -- Passing a handle over an ipc pipe -------------------------------------------------------------
+
+// Two ipc pipes with a Unix domain socket between them, which is what a spawned worker's channel is
+// once both ends are open. A handle crossing this pair crosses the same `sendmsg` with `SCM_RIGHTS`
+// it would cross between two processes -- the kernel does not know or care that one process holds
+// both ends, so the mechanism under test is the real one and nothing here has to fork to reach it.
+private ipc_pair(lp: &Loop) -> (&Pipe, &Pipe)
+    val (a, b) = socket_pair().expect("a socket pair")
+    val one = pipe(true, lp).expect("an ipc pipe")
+    val two = pipe(true, lp).expect("an ipc pipe")
+
+    one.open(a).expect("adopted")
+    two.open(b).expect("adopted")
+    (one, two)
+
+private struct Moved
+    taken: Option[&Tcp]
+    count: usize
+    kind: i32
+    payload: usize
+    reply: Buf[u8]
+
+@test("an accepted socket crosses an ipc pipe, and the far side answers the client on it")
+handle_round_trip()
+    // The whole of what a supervisor and a worker do: the supervisor owns the listener, accepts a
+    // connection and hands the accepted socket over the channel; the worker takes it and talks to a
+    // client it never accepted. This is what `TCP_REUSEPORT` would otherwise be for, and it is the
+    // one that works on macOS.
+    val lp = new_loop().expect("a loop")
+    val (supervisor, worker) = ipc_pair(lp)
+    val server = tcp(lp).expect("a socket")
+
+    server.bind(ip4("127.0.0.1", 0).expect("an address")).expect("bound")
+
+    val held: &Pair = Pair(None, None)
+
+    server.listen(4, () -> held.accepted = Some(server.accept().expect("a connection")))
+
+    val client = tcp(lp).expect("a socket")
+
+    client.connect(server.sockname().expect("the port"), (r) ->
+        r.expect("connected")
+        held.connected = Some(client)).expect("connecting")
+
+    while held.accepted.is_none() || held.connected.is_none()
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    val conn = held.accepted.expect("a connection")
+    val moved: &Moved = Moved(None, 0, UNKNOWN_HANDLE, 0, buf())
+
+    // The receiving side, and every part of it is in the read callback because that is the only
+    // place a pending handle exists.
+    worker.read_start((r) -> r match
+        Data(bytes) ->
+            moved.count = worker.pending_count()
+            moved.kind = worker.pending_type()
+            moved.payload = bytes.len
+
+            val taken = tcp(lp).expect("a socket to put it in")
+
+            worker.accept_pending(taken).expect("the handle was there")
+            taken.write([7]).expect("queued")
+            moved.taken = Some(taken)
+        End -> worker.close()
+        Failed(_) -> worker.close()).expect("reading")
+
+    client.read_start((r) -> r match
+        Data(bytes) ->
+            moved.reply.extend(bytes)
+            client.close()
+        End -> client.close()
+        Failed(_) -> client.close()).expect("reading")
+
+    // **The handle has to stay ours until the write has gone**, because the descriptor is duplicated
+    // when libuv reaches the `sendmsg` rather than when the write is queued.
+    supervisor.write_handle([1], conn, (r) ->
+        r.expect("the handle was sent")
+        conn.close()).expect("queued")
+
+    while moved.reply.len() == 0
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    assert_eq(moved.count, 1)
+    assert_eq(moved.kind, HANDLE_TCP)
+    assert_eq(moved.payload, 1)
+    assert_eq(moved.reply.len(), 1)
+    assert_eq(moved.reply[0], 7)
+
+    // And the copy the worker took is a socket in its own right, connected to the client.
+    val taken = moved.taken.expect("the worker took the handle")
+
+    assert(taken.is_writable(), "the handle that crossed is a live connection")
+    assert(taken.peername().is_ok(), "with a peer on the other end of it")
+
+    taken.close()
+    server.close()
+    worker.close()
+    supervisor.close()
+    lp.run().expect("the loop drained")
+end handle_round_trip
+
+@test("a handle may only be written to an ipc pipe")
+handle_needs_an_ipc_pipe()
+    // A connected pipe that was not made with `ipc` is the case worth pinning: the refusal is about
+    // the flag rather than about the pipe being unusable, so an ordinary `write` on the same handle
+    // still works.
+    val lp = new_loop().expect("a loop")
+    val (one, two) = connected_pair(lp)
+    val t = tcp(lp).expect("a socket")
+
+    assert_eq(one.write_handle([1], t).unwrap_err(), Error(EINVAL))
+    one.write([1]).expect("bytes on their own are fine")
+
+    t.close()
+    one.close()
+    two.close()
+    lp.run().expect("the loop drained")
+
+@test("nothing is pending on an ipc pipe nobody has sent a handle to")
+nothing_pending()
+    val lp = new_loop().expect("a loop")
+    val (one, two) = ipc_pair(lp)
+    val into = tcp(lp).expect("a socket")
+
+    assert_eq(one.pending_count(), 0)
+    assert_eq(one.pending_type(), UNKNOWN_HANDLE)
+
+    // Taking one anyway is `EAGAIN` rather than a handle that is quietly wrong, which is what a
+    // receiver that did not ask `pending_count` first gets.
+    assert_eq(one.accept_pending(into).unwrap_err(), Error(EAGAIN))
+
+    into.close()
+    one.close()
+    two.close()
+    lp.run().expect("the loop drained")

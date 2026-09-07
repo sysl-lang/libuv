@@ -29,6 +29,22 @@
 // **The flag is written from the CHILD's point of view**, which is libuv's convention and is the
 // one thing about this that is easy to get backwards: a pipe the parent *reads* is one the child
 // *writes*, so it is `WRITABLE_PIPE`.
+//
+// ## A slot that carries handles
+//
+// **A `ToPipe` slot may be an ipc pipe**, and that is how a supervisor hands accepted connections
+// to a worker. Nothing extra is needed here: the pipe is made with `pipe(true)` and the slot is
+// given both directions, since the channel is used in both.
+//
+//     val to_worker = pipe(true)?
+//
+//     spawn(exe, ["--worker"], on_exit,
+//           [Inherit, Inherit, Inherit, ToPipe(to_worker, READABLE_PIPE | WRITABLE_PIPE)])?
+//
+// **`stdio` is not limited to three slots** -- as many as are listed are wired up, so the channel
+// above is the child's descriptor 3, which it adopts with `pipe(true)?.open(3)`. `Pipe.write_handle`
+// is what sends a handle across it and `Pipe.accept_pending` is what takes one; `pipe.sysl` has the
+// whole shape.
 
 module sh.sysl.libuv
 

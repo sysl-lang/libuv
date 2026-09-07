@@ -665,6 +665,31 @@ child_process()
     assert_eq(got.bytes[0], 104)
     assert_eq(got.bytes[5], 10)
 
+@test("a child may be given more than three descriptors, and the fourth of them is its fd 3")
+extra_stdio_slot()
+    // What a supervisor's ipc channel to a worker rests on: `stdio` is not limited to the three a
+    // shell wires up, and slot `i` is the child's descriptor `i`. The channel itself needs a child
+    // that speaks it, so what this pins is the wiring -- a shell writing to `>&3` is the shortest
+    // program that can say whether the descriptor arrived.
+    val lp = default_loop()
+    val extra = pipe(false, lp).expect("a pipe")
+    val got: &Sink = Sink(buf())
+
+    val child = spawn("sh", ["-c", "echo ok >&3"], ignore_exit_status,
+                      [Ignore, Inherit, Inherit, ToPipe(extra, WRITABLE_PIPE)], "", [], 0,
+                      lp).expect("the child started")
+
+    child.on_exit((status, signal) -> child.close())
+
+    extra.read_start((r) -> r match
+        Data(bytes) -> got.add(bytes)
+        End -> extra.close()
+        Failed(_) -> extra.close())
+
+    lp.run().expect("the loop ran")
+
+    assert_eq(got.bytes.len(), 3)
+
 @test("a program that is not there is refused at the call rather than in the callback")
 no_such_program()
     val lp = default_loop()

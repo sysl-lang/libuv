@@ -267,6 +267,8 @@ extern "uv_read_start" read_start(h: *Stream, alloc_cb: *extern(*Handle, usize, 
 extern "uv_read_stop" read_stop(h: *Stream) -> i32
 extern "uv_write" write(req: *Write, h: *Stream, bufs: *Buf, nbufs: u32,
                         cb: *extern(*Write, i32) -> unit) -> i32
+extern "uv_write2" write2(req: *Write, h: *Stream, bufs: *Buf, nbufs: u32, send: *Stream,
+                          cb: *extern(*Write, i32) -> unit) -> i32
 extern "uv_try_write" try_write(h: *Stream, bufs: *Buf, nbufs: u32) -> i32
 extern "uv_shutdown" shutdown(req: *Shutdown, h: *Stream, cb: *extern(*Shutdown, i32) -> unit) -> i32
 extern "uv_is_readable" is_readable(h: *Stream) -> i32
@@ -298,6 +300,8 @@ extern "uv_pipe_connect2" pipe_connect2(req: *Connect, h: *Pipe, name: *u8, name
 extern "uv_pipe_getsockname" pipe_getsockname(h: *Pipe, buffer: *u8, size: *usize) -> i32
 extern "uv_pipe_getpeername" pipe_getpeername(h: *Pipe, buffer: *u8, size: *usize) -> i32
 extern "uv_pipe_chmod" pipe_chmod(h: *Pipe, flags: i32) -> i32
+extern "uv_pipe_pending_count" pipe_pending_count(h: *Pipe) -> i32
+extern "uv_pipe_pending_type" pipe_pending_type(h: *Pipe) -> i32
 extern "uv_pipe" pipe_pair(fds: *i32, read_flags: i32, write_flags: i32) -> i32
 extern "uv_socketpair" socketpair(kind: i32, protocol: i32, socks: *i32, flags0: i32,
                                   flags1: i32) -> i32

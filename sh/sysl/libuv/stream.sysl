@@ -28,6 +28,9 @@
 // `try_write` is the one that does not: it writes what the kernel will take right now and answers
 // how much, without queueing anything. That is the fast path for a program that is willing to
 // handle a partial write itself.
+//
+// **A write may also carry a handle**, which is `Pipe.write_handle` and lives there rather than
+// here: only an ipc pipe can send one, so a `Stream` method would be one every other stream refuses.
 
 module sh.sysl.libuv
 
@@ -65,7 +68,7 @@ private[libuv] ignore_read(r: Read) -> unit = ()
 private[libuv] ignore_status(r: Result[unit, Error]) -> unit = ()
 
 // Bytes of our own, since what a caller passed may be a local and a write outlives the call.
-private copy_of(bytes: []const u8) -> []u8
+private[libuv] copy_of(bytes: []const u8) -> []u8
     var out: []u8 = [0; bytes.len]
 
     for i in 0..<bytes.len do out[i] = bytes[i]
@@ -233,7 +236,7 @@ private stream_connection[S: Stream](h: *c.Stream, status: i32) -> unit
 // each holds a reference to itself until libuv is finished with it -- the same arrangement a handle
 // uses, for the same reason.
 
-private struct WriteReq
+private[libuv] struct WriteReq
     storage: [c.WRITE_WORDS]u64
     bufs: [c.BUF_WORDS]u64
     data: []u8
@@ -243,7 +246,7 @@ private struct WriteReq
     req(*self) -> *c.Write = ptr_cast(&self.storage[0])
     buf(*self) -> *c.Buf = ptr_cast(&self.bufs[0])
 
-private write_done(req: *c.Write, status: i32) -> unit
+private[libuv] write_done(req: *c.Write, status: i32) -> unit
     val w: *WriteReq = ptr_cast(c.req_get_data(ptr_cast(req)))
     val cb = w.on_done
 
