@@ -237,6 +237,23 @@ child_inherits_a_named_descriptor()
     unlink_sync(path).expect("removed")
     rmdir_sync(dir).expect("removed")
 
+@test("a spawn that fails leaves nothing behind on the loop")
+failed_spawn_leaves_no_handle()
+    // A loop of its own, because what is being asked is whether the loop is EMPTY afterwards, and
+    // the default loop is shared with every other test in this file.
+    val lp = new_loop().expect("a loop")
+
+    assert(spawn("/no/such/program/anywhere", [], no_exit_action, [Ignore, Ignore, Ignore], "", [],
+                 0, lp).is_err(), "there is no such program")
+
+    // **`uv_loop_close` is the question, and it answers `EBUSY` while any handle is still on the
+    // loop.** `uv_spawn` registers the handle before it can fail and does not deregister it on the
+    // way out, so a failure that merely dropped the handle would leave the loop holding a link into
+    // storage that has been freed -- which the next handle initialised on any loop then writes
+    // through, eight bytes at a time, into whatever that storage has since become.
+    lp.run().expect("the loop ran")
+    lp.close().expect("the loop closed, so nothing was left on it")
+
 private no_exit_action(status: i64, signal: i32) -> unit = ()
 
 private struct Outcome

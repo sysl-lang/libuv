@@ -210,9 +210,23 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
 
     val r = c.spawn(lp.raw(), p.raw(), &options)
 
+    // **A spawn that failed still has to be CLOSED, and dropping it corrupts the loop.** `uv_spawn`
+    // puts the handle on the loop's handle queue before it does anything that can fail, and it does
+    // not take it off again on the way out -- so a handle whose spawn returned an error is an
+    // ordinary registered handle that has simply never started. Releasing the box here would leave
+    // the loop's queue pointing at freed memory, and the next handle initialised on that loop writes
+    // its own address through the stale link. What comes of that is not a crash at the fault: it is
+    // whatever allocation the box became, silently overwritten eight bytes at a time -- a child's
+    // argument vector, in the case that found this.
+    //
+    // So the failure path closes rather than drops, and `finish_close` releases the box when libuv
+    // says the handle is gone.
     if r < 0
-        p.me = None
-        return Err(Error(r))
+        val err = Error(r)
+
+        p.close()
+
+        return Err(err)
 
     Ok(p)
 

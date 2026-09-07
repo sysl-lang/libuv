@@ -5,7 +5,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.4" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.5" }
 }
 ```
 
