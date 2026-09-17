@@ -69,8 +69,10 @@ private resolve_done(req: *c.GetAddrInfo, status: i32, res: *c.AddrInfo) -> unit
         val name = c.ai_canonname(p)
         val canonical = if name == null then "" else from_cstring(name).unwrap_or("")
 
-        found.push(AddrInfo(address_at(c.ai_addr(p)), c.ai_family(p), c.ai_socktype(p),
-                            c.ai_protocol(p), canonical))
+        // The resolver's address is its family's size and no more, which is not the
+        // `sockaddr_storage` every other address here comes out of.
+        found.push(AddrInfo(address_at_len(c.ai_addr(p), c.ai_addrlen(p)), c.ai_family(p),
+                            c.ai_socktype(p), c.ai_protocol(p), canonical))
         p = c.ai_next(p)
 
     // libuv's storage, released here -- everything above was copied into storage of ours, which is

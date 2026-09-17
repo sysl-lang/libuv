@@ -34,7 +34,7 @@
 //
 // **A `&sync T` makes the reference safe to share, not the object safe to mutate.** Two jobs on the
 // pool writing one `&sync` struct race exactly as they would in C; what the type buys is that the
-// box itself is not torn apart underneath them. `sysl.sync.Atomic[T]` and `sysl.posix.threads.Mutex`
+// box itself is not torn apart underneath them. `sysl.sync.Atomic[T]` and this package's own `Mutex`
 // are what order the writes.
 //
 // **The completion callback is an ordinary closure**, because it runs on the loop's thread and
@@ -137,7 +137,7 @@ private work_done(req: *c.Work, status: i32) -> unit
  *
  * **A job answers by writing, not by returning.** Its closure is `() -> unit`, because a value
  * coming back out of a pool thread would be a value crossing a domain boundary -- which is the same
- * reason `sysl.posix.threads.Thread.join` does not carry one. What a job has to say it says through
+ * reason `Thread.join` beside it does not carry one. What a job has to say it says through
  * a `&sync` it captured, and the completion callback is where that is read.
  *
  * **The job keeps the loop alive while it is queued**, so a program that queues one and calls `run`

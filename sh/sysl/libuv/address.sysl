@@ -105,10 +105,24 @@ private[libuv] blank_address() -> Address = Address([0; c.SOCKADDR_WORDS])
 
 // A copy of whatever libuv or the platform left at an address, into storage of our own. libuv
 // answers a peer's address into a `sockaddr_storage`, and this is how one of those becomes a value.
-private[libuv] address_at(p: *c.SockAddr) -> Address
-    var a = Address([0; c.SOCKADDR_WORDS])
-    val src: *u64 = ptr_cast(p)
+private[libuv] address_at(p: *c.SockAddr) -> Address = address_at_len(p, c.SOCKADDR_WORDS * 8)
 
-    for i in 0..<c.SOCKADDR_WORDS do a.storage[i] = src[i]
+// The same, for an address that is NOT in a `sockaddr_storage`.
+//
+// A resolver's answer points at a `sockaddr_in` or a `sockaddr_in6` -- 16 and 28 bytes -- in an
+// allocation of exactly that size, so copying a whole storage out of one reads off the end of it.
+// AddressSanitizer reports it as a `heap-buffer-overflow` in `resolve_done`; without the sanitizer
+// it is 112 bytes of somebody else's memory, copied into a value and never looked at, which is why
+// every test was green either way.
+//
+// The bytes past `len` stay zero, which is what a `sockaddr_storage` holds beyond the family it is
+// carrying anyway, so every reader below is unaffected.
+private[libuv] address_at_len(p: *c.SockAddr, len: usize) -> Address
+    var a = Address([0; c.SOCKADDR_WORDS])
+    val src: *u8 = ptr_cast(p)
+    val dst: *u8 = ptr_cast(&a.storage[0])
+    val n = if len > c.SOCKADDR_WORDS * 8 then c.SOCKADDR_WORDS * 8 else len
+
+    for i in 0..<n do dst[i] = src[i]
 
     a

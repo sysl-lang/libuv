@@ -115,9 +115,9 @@ with the header links perfectly and corrupts the call at run time — so every d
 of `uv.h` rather than remembered. The upper one has to be **pleasant**, which is a different question
 and would otherwise be answered in the same breath.
 
-### The shim is three shapes and nothing else
+### The shim is three shapes, and a few signatures
 
-`sh/sysl/libuv/c/shim.c` is forty lines, and each of them is one of the three things C can reach and
+`sh/sysl/libuv/c/shim.c` is fifty lines. Most of them are one of the three things C can reach and
 sysl cannot:
 
 | | why |
@@ -125,6 +125,10 @@ sysl cannot:
 | `struct sockaddr`, `struct addrinfo` | the field order is the **platform's**, not libuv's |
 | `uv_stdio_container_t` | libuv declares it with a **union** in it |
 | `uv_buf_t` | declared `{base, len}` on Unix and the other way round on Windows |
+
+The rest are the calls whose **signature** has no sysl spelling: `uv_loop_configure`, which is
+variadic; `uv_thread_self`, which answers with a platform type by value; and `uv_thread_create_ex`,
+whose options struct is positional — its stack size is read only when the flag asking for it is set.
 
 Sizes are not answered there: a `c const` block measures `sizeof` for the target being built for,
 which is the same answer with nothing to keep in step. `tests.sysl` checks each measured size against
@@ -165,7 +169,7 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **loop** | `default_loop`, `new_loop`, `run`, `stop`, `alive`, `now`, `backend_fd`, `configure`, `idle_time` |
 | **timers** | `timer`, `start`, `stop`, `again`, `set_repeat`, `due_in` |
 | **watchers** | `idle`, `prepare`, `check` |
-| **wake-ups** | `notifier` — the one handle another thread may touch |
+| **wake-ups** | `notifier` — the one handle another thread may touch; `waker`, which is the `send` on its own as a value |
 | **signals** | `signal`, `start`, `start_once`, `kill`, `ignore_sigpipe` |
 | **streams** | `read_start`, `write`, `try_write`, `shutdown`, `listen`, back-pressure |
 | **TCP** | `tcp`, `bind` (with `TCP_IPV6ONLY` and `TCP_REUSEPORT`), `listen`, `accept`, `connect`, `nodelay`, `keepalive`, `sockname` |
@@ -173,16 +177,23 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **terminals** | `tty`, `set_mode`, `winsize`, `reset_tty_mode`, `guess_handle` |
 | **names** | `resolve` — `getaddrinfo` on the thread pool |
 | **the pool** | `queue` — a job on a worker thread, answered on the loop; `cancel`, `is_pending` |
+| **threads** | `thread`, `thread_with_stack`, `join`, `id`, `current_thread`, `set_thread_name` |
+| **locks** | `mutex`, `recursive_mutex`, `cond`, `semaphore`, `rwlock`, `barrier` |
 | **files, blocking** | `open_sync`, `read_file_sync`, `write_file_sync`, `stat_sync`, `scandir_sync`, `symlink_sync`, … |
 | **files, not** | `open`, `read`, `write`, `stat`, `scandir`, `read_file`, … |
 | **children** | `spawn`, `Stdio`, `kill`, `on_exit` |
 | **the machine** | `hrtime`, `hostname`, `cwd`, `env`, `available_parallelism`, memory, load |
 
 **What is not bound yet**, and is ordinary work rather than anything blocked: UDP, `uv_poll_t`,
-`uv_fs_event_t` and `uv_fs_poll_t`, `getnameinfo`, `uv_random`, threads and the locks that go with
-them, and `dlopen`. Each is a section of `uv.h` and each would be added the way the ones above were.
-libuv's own threads and mutexes are the one entry there that a program need not wait for:
-`sysl.posix.threads` and `sysl.sync` already have both.
+`uv_fs_event_t` and `uv_fs_poll_t`, `getnameinfo`, `uv_random`, and `dlopen`. Each is a section of
+`uv.h` and each would be added the way the ones above were.
+
+**Three of libuv's threading calls are left out on purpose.** `uv_thread_detach` would free the box a
+running body lives in, which is the one thing a binding must not offer; `uv_once` needs a guard in
+static storage, which is what shuts a package out of a bare-metal target; and `uv_key_*` is
+thread-local storage of a `void *`, which is a language feature rather than something to reach
+through a library. Thread priority, affinity and `uv_thread_getcpu` are scheduling rather than
+threading, and are the same ordinary work as the list above.
 
 ## One port, several listeners
 
@@ -306,6 +317,101 @@ a program's environment carries rather than a function this package could honest
 also **shared**, so a job that blocks for a second is a second in which one of those four threads
 resolves no names and reads no files.
 
+## Threads
+
+A pool job borrows one of libuv's four worker threads and gives it back, so it is for something slow
+that has an end. A **thread** is for something that outlives the call: an actor with a loop of its
+own, a reader blocked on a device libuv has no backend for, a second event loop serving a second
+port. `thread` starts one and `join` waits for it:
+
+```sysl
+val running: &sync Atomic[int] = Atomic(1)
+
+val t = thread(() -> serve(running))?      // the body is a &sync Fn, like a pool job's
+
+running.store(0)
+t.join()?
+```
+
+**What may cross into a thread is what may cross into a pool job**, for the same reason and with the
+same refusal: scalars and arrays are copied in, a `&sync T` is how two threads share one object, a
+`*T` carries no count — and a `string`, a slice or an ordinary `&T` is refused at the closure, named.
+
+**A thread holds a reference to itself while it runs**, so a body is never freed underneath a running
+thread, and `join` is what drops it. There is no `detach`, and that is deliberate: the body lives in
+that box, so a detached thread would be running a closure with nothing keeping it alive. A thread
+that should not be waited for is given something to wait on instead. Joining twice answers `EINVAL`
+rather than the undefined behaviour POSIX would give it.
+
+### The mailbox
+
+A thread with a loop of its own is reached the way libuv reaches any loop from outside: leave the
+message where both threads can see it, and wake the loop with an `Async`. **A handle is a `&T` and a
+body may not capture one**, so what crosses is a `Waker` — an address, and `uv_async_send` is the one
+libuv call safe from any thread at all:
+
+```sysl
+val t = thread(() ->
+    val lp = new_loop().expect("a loop of its own")
+    val a = notifier(() -> drain(box), lp).expect("a notifier on it")
+
+    box.wake = Some(a.waker())          // the one thing here another thread may hold
+    box.ready.post()
+
+    lp.run().expect("the thread's loop ran"))?
+
+box.ready.wait()
+
+val wake = box.wake.expect("the thread published it")
+
+box.lock.lock()
+box.slots[box.held] = 1
+box.held += 1
+box.lock.unlock()
+
+wake.send()?                            // the loop runs `drain` on its own thread
+```
+
+**The mutex guards the queue and the wake-up carries no data**, which is the shape libuv is built
+for: sends coalesce, so the callback's job is to drain whatever is there rather than to be counted.
+The handle has to outlive every waker taken from it — the arrangement above has the thread owning
+both, which makes that true by construction.
+
+**The queue is an array rather than a `Buf`**, and not by preference: a growable collection owns its
+elements through a count that is not atomic, so a `&sync` struct may not hold one and the compiler
+says so. A fixed array is what a shared queue is made of today.
+
+### The locks
+
+None of them is a handle: they belong to no loop, have no close callback, and are released by
+`destroy`. Each is a `&sync T`, because a lock only one thread can reach is not a lock — and because
+`&sync` is what a body may capture.
+
+| | |
+|---|---|
+| `mutex`, `recursive_mutex` | `lock`, `try_lock`, `unlock`, and `with(f)`, which holds it for a closure and answers what the closure did |
+| `cond` | `wait(m)`, `timed_wait(m, ns)`, `signal`, `broadcast` |
+| `semaphore(n)` | `wait`, `try_wait`, `post` — and unlike a condition it *remembers* a post nobody was waiting for |
+| `rwlock` | `read_lock`, `write_lock`, their `try_` forms, and `reading(f)` / `writing(f)` |
+| `barrier(n)` | `wait`, which answers `true` for the one thread that may `destroy` it |
+
+**`unlock` on a mutex this thread does not hold is undefined**, in libuv and in pthreads under it,
+and nothing here checks it: the word it would cost is paid by every correct program. `with` is the
+form that cannot get it wrong, and the bare pair is for the case that cannot use it — a lock held
+across a `wait`, or across a callback that drains a queue.
+
+**A condition carries no state**, so a `signal` nobody is waiting for is lost, and a wait may return
+without one. That is why the test is a loop and never an `if`:
+
+```sysl
+m.lock()
+
+while queue_is_empty()
+    ready.wait(m)
+
+m.unlock()
+```
+
 ## The file system, both ways round
 
 A file system call blocks, however fast the disk is, so libuv runs the asynchronous form on its
@@ -374,14 +480,14 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and twenty-eight of them, over seven files, and every public entry point but one is exercised
+**A hundred and forty-eight of them, over eight files, and every public entry point but one is exercised
 by one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
 macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
 binding, and a test runner has no controlling terminal to use instead. It says so at the site.
 
 **The whole raw layer is exercised too**, which is a separate file: a declaration nothing calls is a
 declaration nothing checks, and a signature that disagrees with `uv.h` links perfectly and corrupts
-the call at run time. Every one of the 187 `extern`s is now reached, from the pleasant layer or from
+the call at run time. Every one of the 223 `extern`s is now reached, from the pleasant layer or from
 `raw_tests.sysl` directly. `uv_cancel` was the one exception until the thread pool arrived — it may
 only be called on a request still in flight, and on a finished one it faults, so there was nothing
 safe to call it from. `Work.cancel` is that caller now, because a request knows whether it is still
@@ -395,6 +501,23 @@ handle a program ever opened with every other test still green. `closing_frees` 
 of each handle type per round and asserts resident memory stops growing once the allocator has
 settled. Removing one line from any single `finish_close` turns it red; that was checked against
 three of them.
+
+### Under AddressSanitizer
+
+```
+SYSL_EXTRA_CFLAGS="-fsanitize=address -g" sysl test .
+```
+
+**What that reaches is the sysl half.** libuv is a library the machine already has, so nothing of
+libuv's is instrumented — what is, is this binding's own pointer arithmetic, which is where a binding's
+risk lives anyway. It found a real one: `resolve_done` copied a whole `sockaddr_storage` out of a
+resolver's answer, which points at a `sockaddr_in` of sixteen bytes in an allocation of exactly that
+size, so every lookup read 112 bytes past the end of it. The suite was green before and after, because
+the extra bytes went into a value nothing reads — `ai_addrlen` is what the copy is bounded by now.
+
+**`closing_frees` fails under the sanitizer and only under it.** It asserts that resident memory stops
+growing, and ASan gives every block a redzone and holds freed ones in a quarantine, so RSS grows
+whatever the reference counting does. Read that test's answer from a run without the flag.
 
 **`Loop.fork` is tested by actually forking**, which took two attempts worth recording: the first
 version passed with the call under test taken out, because a loop carrying only a timer does not

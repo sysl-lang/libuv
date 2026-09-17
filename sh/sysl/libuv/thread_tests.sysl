@@ -1,0 +1,480 @@
+module sh.sysl.libuv
+@tests
+
+// What threads and the locks claim, run by `sysl test .`.
+//
+// **The claim under test is that two threads really are two threads.** A `thread` that quietly ran
+// its body on the calling thread would pass any test asking only whether the body ran -- so the
+// first case below compares identifiers across the two sides, and the counting case would come out
+// low if the lock did nothing.
+//
+// **Every wait here is bounded.** A condition variable, a semaphore or a join that never returns
+// hangs the whole suite rather than failing it, so anything that waits either waits for something
+// this file has already posted, or waits with a timeout.
+//
+// **The shared state is `&sync`**, which is what a body is allowed to capture. A plain field inside
+// one is the thing the mutex is there to order; an `Atomic` is what is read without the lock.
+
+import sysl.sync.Atomic
+
+// A count two threads raise, deliberately NOT atomic: it is what the mutex is under test for.
+private struct Counter
+    n: int
+
+private counter() -> &sync Counter = Counter(0)
+
+// What a body reports back through, since a body cannot return anything.
+private struct Seen
+    ran: Atomic[int]
+    matched: Atomic[int]
+
+private seen() -> &sync Seen = Seen(Atomic(0), Atomic(0))
+
+// -- A thread is somewhere else --------------------------------------------------------------------
+
+@test("a body runs on a thread of its own and join waits for it")
+thread_runs_and_joins()
+    val s = seen()
+    val here = current_thread()
+
+    val t = thread(() ->
+        s.ran.add(1)
+        if current_thread() == here then s.matched.add(1)).expect("the thread started")
+
+    t.join().expect("the thread was waited for")
+
+    assert_eq(s.ran.load(), 1)
+    assert_eq(s.matched.load(), 0, "the body did not run on the calling thread")
+    assert(t.is_joined(), "and the handle says so")
+
+@test("a thread's identifier is its own, and the calling thread's is stable")
+thread_identifiers()
+    val s = seen()
+    val here = current_thread()
+
+    assert(here == current_thread(), "the same thread twice is the same identifier")
+
+    val t = thread(() -> s.ran.add(1)).expect("the thread started")
+    val there = t.id()
+
+    assert(!(there == here), "the thread libuv made is not this one")
+
+    t.join().expect("joined")
+
+@test("joining twice answers EINVAL rather than crashing")
+thread_join_twice()
+    val t = thread(() -> ()).expect("the thread started")
+
+    t.join().expect("the first join waited")
+
+    t.join() match
+        Ok(_) -> assert(false, "a second join should be refused")
+        Err(e) -> assert_eq(e.code, EINVAL)
+
+@test("a thread with a stack of its own runs the same way")
+thread_with_its_own_stack()
+    val s = seen()
+
+    val t = thread_with_stack(() -> s.ran.add(1), 262144).expect("the thread started")
+
+    t.join().expect("joined")
+    assert_eq(s.ran.load(), 1)
+
+@test("a thread names itself, and the name comes back through the handle")
+thread_names_itself()
+    val s = seen()
+    val named = semaphore().expect("a semaphore")
+    val go = semaphore().expect("another")
+
+    val t = thread(() ->
+        set_thread_name("libuv-test").expect("the thread named itself")
+        named.post()
+        go.wait()).expect("the thread started")
+
+    named.wait()
+
+    val name = t.name()
+
+    go.post()
+    t.join().expect("joined")
+
+    name match
+        Ok(n) -> assert_eq(n, "libuv-test")
+        Err(e) -> assert_eq(e.code, ENOSYS, "a platform with no thread names says so")
+
+// -- The lock --------------------------------------------------------------------------------------
+
+@test("two threads raising one count under a mutex lose none of it")
+mutex_counts_exactly()
+    val m = mutex().expect("a mutex")
+    val k = counter()
+
+    val bump: &sync Fn() -> unit = () ->
+        for i in 0..<5000
+            m.lock()
+            k.n += 1
+            m.unlock()
+
+    val a = thread(bump).expect("one thread")
+    val b = thread(bump).expect("another")
+
+    a.join().expect("joined")
+    b.join().expect("joined")
+
+    assert_eq(k.n, 10000)
+
+    m.destroy()
+
+@test("try_lock answers whether the lock was free, and never waits")
+mutex_try_lock()
+    val m = mutex().expect("a mutex")
+
+    assert(m.try_lock(), "nobody holds a new mutex")
+
+    val s = seen()
+
+    // Another thread, because a second try_lock on this one is undefined rather than false.
+    val t = thread(() -> if !m.try_lock() then s.ran.add(1)).expect("the thread started")
+
+    t.join().expect("joined")
+    assert_eq(s.ran.load(), 1, "a held lock refuses a second holder")
+
+    m.unlock()
+
+    val u = thread(() ->
+        if m.try_lock()
+            s.matched.add(1)
+            m.unlock()).expect("the thread started")
+
+    u.join().expect("joined")
+    assert_eq(s.matched.load(), 1, "and takes it once it is free")
+
+    m.destroy()
+
+@test("with holds the lock for the closure and releases it afterwards")
+mutex_with()
+    val m = mutex().expect("a mutex")
+    val k = counter()
+
+    val n = m.with(() ->
+        k.n += 7
+        k.n)
+
+    assert_eq(n, 7, "the closure's answer comes back")
+    assert(m.try_lock(), "and the lock was released")
+
+    m.unlock()
+    m.destroy()
+
+@test("a recursive mutex takes itself twice")
+recursive_mutex_takes_itself()
+    val m = recursive_mutex().expect("a recursive mutex")
+
+    m.lock()
+    m.lock()
+    m.unlock()
+    m.unlock()
+
+    assert(m.try_lock(), "both of them were given back")
+
+    m.unlock()
+    m.destroy()
+
+// -- The condition -----------------------------------------------------------------------------
+
+@test("a consumer waits on a condition and a producer wakes it")
+cond_producer_consumer()
+    val m = mutex().expect("a mutex")
+    val ready = cond().expect("a condition")
+    val k = counter()
+    val s = seen()
+
+    // The consumer: takes the lock, and waits until the queue is not empty. The test is a loop
+    // because a wait may return without a signal.
+    val t = thread(() ->
+        m.lock()
+
+        while k.n == 0
+            ready.wait(m)
+
+        s.ran.add(k.n)
+        k.n = 0
+        m.unlock()).expect("the consumer started")
+
+    m.lock()
+    k.n = 42
+    m.unlock()
+
+    ready.signal()
+
+    t.join().expect("the consumer finished")
+
+    assert_eq(s.ran.load(), 42)
+
+    ready.destroy()
+    m.destroy()
+
+@test("broadcast wakes every waiter")
+cond_broadcast()
+    val m = mutex().expect("a mutex")
+    val ready = cond().expect("a condition")
+    val k = counter()
+    val s = seen()
+
+    val waiter: &sync Fn() -> unit = () ->
+        m.lock()
+
+        while k.n == 0
+            ready.wait(m)
+
+        m.unlock()
+        s.ran.add(1)
+
+    val a = thread(waiter).expect("one waiter")
+    val b = thread(waiter).expect("another")
+    val cc = thread(waiter).expect("a third")
+
+    m.lock()
+    k.n = 1
+    m.unlock()
+
+    ready.broadcast()
+
+    a.join().expect("joined")
+    b.join().expect("joined")
+    cc.join().expect("joined")
+
+    assert_eq(s.ran.load(), 3)
+
+    ready.destroy()
+    m.destroy()
+
+@test("a timed wait on nothing answers ETIMEDOUT rather than waiting for ever")
+cond_times_out()
+    val m = mutex().expect("a mutex")
+    val ready = cond().expect("a condition")
+
+    m.lock()
+
+    val r = ready.timed_wait(m, 20000000)
+
+    m.unlock()
+
+    r match
+        Ok(_) -> assert(false, "nothing signalled it")
+        Err(e) -> assert_eq(e.code, ETIMEDOUT)
+
+    ready.destroy()
+    m.destroy()
+
+// -- The semaphore -----------------------------------------------------------------------------
+
+@test("a semaphore remembers a post nobody was waiting for")
+semaphore_counts()
+    val s = semaphore().expect("a semaphore at zero")
+
+    assert(!s.try_wait(), "there is nothing to take")
+
+    s.post()
+
+    assert(s.try_wait(), "and now there is")
+    assert(!s.try_wait(), "which was the only one")
+
+    s.destroy()
+
+@test("a semaphore starting above zero lets that many through")
+semaphore_starts_full()
+    val s = semaphore(2).expect("a semaphore at two")
+
+    s.wait()
+    s.wait()
+
+    assert(!s.try_wait(), "and no more than that")
+
+    s.destroy()
+
+@test("a post from another thread releases a thread already waiting")
+semaphore_releases_a_waiter()
+    val s = semaphore().expect("a semaphore")
+    val waiting = semaphore().expect("another")
+    val seen_it = seen()
+
+    val t = thread(() ->
+        waiting.post()
+        s.wait()
+        seen_it.ran.add(1)).expect("the waiter started")
+
+    waiting.wait()
+
+    assert_eq(seen_it.ran.load(), 0, "it is still waiting")
+
+    s.post()
+    t.join().expect("the waiter was released")
+
+    assert_eq(seen_it.ran.load(), 1)
+
+    s.destroy()
+    waiting.destroy()
+
+// -- The reader/writer lock ----------------------------------------------------------------------
+
+@test("readers go in together and a writer waits for them")
+rwlock_readers_and_writers()
+    val l = rwlock().expect("a lock")
+    val s = seen()
+
+    l.read_lock()
+
+    val t = thread(() ->
+        if l.try_read_lock()
+            s.ran.add(1)
+            l.read_unlock()
+
+        if !l.try_write_lock() then s.matched.add(1)).expect("the reader started")
+
+    t.join().expect("joined")
+
+    assert_eq(s.ran.load(), 1, "a second reader is let in")
+    assert_eq(s.matched.load(), 1, "a writer is not")
+
+    l.read_unlock()
+
+    assert(l.try_write_lock(), "and is once the readers have gone")
+
+    l.write_unlock()
+    l.destroy()
+
+@test("writing and reading hold the lock for the closure")
+rwlock_with()
+    val l = rwlock().expect("a lock")
+    val k = counter()
+
+    l.writing(() -> k.n = 3)
+
+    val n = l.reading(() -> k.n)
+
+    assert_eq(n, 3)
+    assert(l.try_write_lock(), "both of them released it")
+
+    l.write_unlock()
+    l.destroy()
+
+// -- The barrier -------------------------------------------------------------------------------
+
+@test("a barrier holds every thread until the last one reaches it")
+barrier_meets()
+    val b = barrier(3).expect("a barrier for three")
+    val k = counter()
+    val m = mutex().expect("a mutex")
+    val s = seen()
+
+    val arrive: &sync Fn() -> unit = () ->
+        m.with(() -> k.n += 1)
+
+        if b.wait().expect("the barrier opened")
+            s.matched.add(1)
+            b.destroy()
+
+        s.ran.add(1)
+
+    val a = thread(arrive).expect("one")
+    val c2 = thread(arrive).expect("two")
+
+    m.with(() -> k.n += 1)
+
+    val serial = b.wait().expect("the barrier opened")
+
+    // Read the instant this thread is let through: the barrier's whole claim is that the other two
+    // had arrived by then, and a barrier that let anybody through early would answer less.
+    val at_open = m.with(() -> k.n)
+
+    a.join().expect("joined")
+    c2.join().expect("joined")
+
+    assert_eq(at_open, 3, "every thread had arrived before any of them was let through")
+    assert_eq(s.ran.load(), 2)
+
+    val winners = s.matched.load() + (if serial then 1 else 0)
+
+    assert_eq(winners, 1, "exactly one of them is told to destroy it")
+
+    if serial then b.destroy()
+
+    m.destroy()
+
+// -- The mailbox, which is what all of it is for -------------------------------------------------
+
+// A queue two threads share: the mutex guards the messages, and the waker is how the thread's loop
+// is told there are some. Everything read without the lock is an `Atomic`.
+//
+// **The queue is an array rather than a `Buf`**, and not by preference: a growable collection owns
+// its elements through a count that is not atomic, so a `&sync` struct may not hold one. The
+// compiler says exactly that -- *"its 'queue.elems' reaches a '[]int', which owns its elements
+// through a count that is not atomic"* -- and a fixed array is what a shared queue can be made of
+// today.
+private struct Mailbox
+    lock: &sync Mutex
+    ready: &sync Semaphore
+    slots: [128]int
+    held: int
+    wake: Option[Waker]
+    drained: Atomic[int]
+    total: Atomic[int]
+
+private mailbox() -> &sync Mailbox
+    val m: &sync Mailbox = Mailbox(mutex().expect("a mutex"), semaphore().expect("a semaphore"),
+                                   [0; 128], 0, None, Atomic(0), Atomic(0))
+    m
+
+// On the thread's own loop, once per wake-up at least -- sends coalesce, so this drains whatever is
+// there rather than handling one message.
+private drain(m: &sync Mailbox, lp: &Loop)
+    m.lock.lock()
+
+    while m.held > 0
+        m.held -= 1
+        m.total.add(m.slots[m.held])
+        m.drained.add(1)
+
+    m.lock.unlock()
+
+    if m.drained.load() == 100 then lp.stop()
+
+@test("a thread with its own loop takes a hundred messages through a mutex and an async")
+thread_mailbox()
+    val m = mailbox()
+
+    // The thread owns its loop and its handle, which is what makes every waker taken from it safe
+    // for as long as the thread is running.
+    val t = thread(() ->
+        val lp = new_loop().expect("a loop of its own")
+        val a = notifier(() -> drain(m, lp), lp).expect("a notifier on it")
+
+        m.wake = Some(a.waker())
+        m.ready.post()
+
+        lp.run().expect("the thread's loop ran")
+
+        a.close()
+        lp.run().expect("the close was handled")
+        lp.close().expect("the loop was released")).expect("the thread started")
+
+    m.ready.wait()
+
+    val wake = m.wake.expect("the thread published its waker before posting")
+
+    for i in 0..<100
+        m.lock.lock()
+        m.slots[m.held] = i + 1
+        m.held += 1
+        m.lock.unlock()
+
+        wake.send().expect("the loop was woken")
+
+    t.join().expect("the thread's loop ended and it was joined")
+
+    assert_eq(m.drained.load(), 100, "every message arrived")
+    assert_eq(m.total.load(), 5050, "and each of them is the one that was sent")
+
+    m.lock.destroy()
+    m.ready.destroy()

@@ -1,0 +1,454 @@
+// A thread of your own, and the locks that order what two of them do.
+//
+// **A loop belongs to one thread.** Everything else in this package is that thread's, and a second
+// thread that wants an event loop makes one with `new_loop()` and runs it itself. This file is what
+// starts that thread and what the two of them use to agree on anything.
+//
+//     val running: &sync Atomic[int] = Atomic(1)
+//
+//     val t = thread(() -> serve(running))?
+//     ...
+//     running.store(0)
+//     t.join()?
+//
+// **What may cross into a thread is what may cross into a pool job**, and for the same reason: the
+// body is a `&sync Fn`, so the compiler checks capture by capture and the refusal names the one that
+// has to change. `work.sysl` states the rule and the table; nothing here relaxes it.
+//
+// **A thread here is not a pool job.** `queue` is for something slow that has an end -- it borrows
+// one of libuv's four worker threads and gives it back. A thread is for something that outlives the
+// call: an actor with its own loop, a reader that blocks on a device libuv has no backend for, a
+// second event loop serving a second port. Four jobs that never return are a pool that resolves no
+// names and reads no files ever again.
+//
+// ## The mailbox
+//
+// A thread with a loop of its own is reached the way libuv reaches any loop from outside: leave the
+// message somewhere both threads can see, and wake the loop with an `Async`.
+//
+//     val inbox: &sync Mutex = mutex()?
+//     var queued: &sync Counter = Counter(Atomic(0))
+//
+//     val wake = notifier(() -> drain(inbox, queued), lp)?        // on the thread's own loop
+//
+//     // ... from anywhere: put it in the queue, then wake the loop up
+//     inbox.lock()
+//     queued.n.add(1)
+//     inbox.unlock()
+//     wake.send()?
+//
+// **The mutex guards the queue and the `Async` carries no data**, which is the shape libuv is built
+// for: sends coalesce, so the callback's job is to drain whatever is there rather than to be counted.
+//
+// ## Nothing here is a handle
+//
+// A `Mutex`, a `Cond`, a `Semaphore`, an `RwLock` and a `Barrier` belong to no loop, have no close
+// callback, and are released by `destroy` rather than by `close`. They are `&sync T` because two
+// threads hold the same one -- that is the whole point of them, and it is also what a thread's body
+// is allowed to capture.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.text.{cstring, from_cstring}
+
+// A body for a thread that has finished, so that the field is never empty. The `&sync` counterpart
+// of `noop`, and there for the same reason as `sync_noop` beside the thread pool.
+private thread_noop() -> unit = ()
+
+/** The operating system's name for a thread -- a `pthread_t` here, a `HANDLE` on Windows.
+ *
+ * **It is a value rather than a handle**: it is copied, compared, and carries nothing that has to be
+ * released. Comparing is `==`, which is `uv_thread_equal` rather than a comparison of the bytes,
+ * because a platform is free to make the identifier a structure with padding in it.
+ */
+struct ThreadId
+    private storage: [c.THREAD_WORDS]u64
+end ThreadId
+
+/** Two identifiers name the same thread. libuv's own comparison, not this side's. */
+impl Eq for ThreadId
+    eq(self, rhs: ThreadId) -> bool
+        var a = self
+        var b = rhs
+
+        c.thread_equal(ptr_cast(&a.storage[0]), ptr_cast(&b.storage[0])) != 0
+
+/** The calling thread's own identifier, which is what a body compares against to learn which side of
+ * `thread` it is on.
+ */
+current_thread() -> ThreadId
+    var id = ThreadId([0; c.THREAD_WORDS])
+
+    c.thread_self(ptr_cast(&id.storage[0]))
+    id
+
+/** Name the calling thread, which is what a debugger and `ps` show.
+ *
+ * The limit is the platform's -- fifteen characters on Linux, longer here -- and libuv truncates
+ * rather than refusing. It names *this* thread, so a thread that wants a name gives itself one at
+ * the top of its body.
+ */
+set_thread_name(name: string) -> Result[unit, Error]
+    val n = cstring(name)
+
+    checked(c.thread_setname(n.ptr))
+
+/** A thread started by `thread`, and the only thing here that has to be joined.
+ *
+ * **It holds a reference to itself while it runs**, exactly as a handle does, so a program that does
+ * not bind the result still gets a thread that runs to the end rather than a body freed underneath
+ * it. `join` is what drops that reference.
+ *
+ * **There is no `detach`**, and `uv_thread_detach` is deliberately not bound: the body lives in this
+ * box, the box is released when the last reference to it goes, and a detached thread would be
+ * reading a closure that no longer exists. A thread that should not be waited for is given something
+ * to wait on instead -- a flag it reads, or a message on its loop.
+ */
+struct Thread
+    private tid: [c.THREAD_WORDS]u64
+    private me: Option[&sync Thread]
+    private body: &sync Fn() -> unit
+    private done: bool
+
+    private raw(*self) -> *c.ThreadId = ptr_cast(&self.tid[0])
+
+    /** The operating system's name for this thread, which is what its own `current_thread()`
+     * answers.
+     */
+    id(*self) -> ThreadId = ThreadId(self.tid)
+
+    /** Whether this thread has been joined. A thread still running answers `false`, and so does one
+     * that has finished and not been waited for -- what it reports is this side's bookkeeping rather
+     * than the thread's state, which is the question `join` asks the operating system.
+     */
+    is_joined(*self) -> bool = self.done
+
+    /** Wait for the thread to finish.
+     *
+     * **The body's answer does not come back through this call.** A value coming out of another
+     * thread is a value crossing a concurrency domain, which is the same reason `queue`'s job is a
+     * `() -> unit`: what a thread has to say it says through the `&sync` it captured.
+     *
+     * **Joining twice is `EINVAL` from this side rather than undefined behaviour from POSIX**, which
+     * is one field's worth of bookkeeping and worth it: a second join is otherwise a crash in a
+     * library that has no way to name the caller.
+     */
+    join(*self) -> Result[unit, Error]
+        if self.done then return Err(Error(EINVAL))
+
+        checked(c.thread_join(self.raw()))?
+
+        // The self-reference may be the last one, so it is held here until the call is over.
+        val keep = self.me
+
+        self.done = true
+        self.body = thread_noop
+        self.me = None
+
+        Ok(())
+
+    /** The name the thread gave itself, or the platform's default for one that gave itself none.
+     *
+     * `ENOSYS` where the platform has no such thing.
+     */
+    name(*self) -> Result[string, Error]
+        var buf: [256]u8 = [0; 256]
+
+        checked(c.thread_getname(self.raw(), &buf[0], 256))?
+
+        Ok(from_cstring(&buf[0]).unwrap_or(""))
+end Thread
+
+// Called on the new thread, and one of the two places in this package where sysl runs anywhere but
+// a loop's own thread. It reads one field and calls it; everything else the box holds belongs to the
+// thread that made it.
+private thread_run(arg: *u8) -> unit
+    val t: *Thread = ptr_cast(arg)
+
+    t.body()
+
+@crossing(body)
+private start(body: &sync Fn() -> unit, stack: usize) -> Result[&sync Thread, Error]
+    var t: &sync Thread = Thread([0; c.THREAD_WORDS], None, body, false)
+
+    // Before the thread exists, because a thread that starts immediately reads this box.
+    t.me = Some(t)
+
+    var r: i32 = 0
+
+    if stack == 0
+        r = c.thread_create(t.raw(), &thread_run, ptr_cast(&*t))
+    else
+        r = c.thread_create_ex(t.raw(), c.THREAD_HAS_STACK_SIZE, stack, &thread_run, ptr_cast(&*t))
+
+    if r < 0
+        t.me = None
+        return Err(Error(r))
+
+    Ok(t)
+
+/** Run `body` on a thread of its own, with the platform's default stack.
+ *
+ * **`body` is a `&sync Fn`, so what it may capture is what a pool job may capture**: scalars and
+ * arrays, which are copied into it; a `&sync T`, which is how two threads share one object; and a
+ * `*T`, which carries no count. A `string`, a slice and an ordinary `&T` are refused at the closure,
+ * and the refusal names the capture and what to hold it as.
+ *
+ * **The thread runs until the body returns**, whatever the thread that started it does -- a program
+ * that exits without joining ends it wherever it had got to, like any other thread.
+ */
+@crossing(body)
+thread(body: &sync Fn() -> unit) -> Result[&sync Thread, Error] = start(body, 0)
+
+/** The same, with a stack of a size you choose, rounded up to the platform's page size.
+ *
+ * **A stack below the platform's minimum is `EINVAL`** -- 16 KiB is the floor on macOS, and `0` here
+ * means the default rather than "none". What wants this is a program with many threads that each
+ * need very little, since the default is measured in megabytes of address space per thread.
+ */
+@crossing(body)
+thread_with_stack(body: &sync Fn() -> unit, stack: usize) -> Result[&sync Thread, Error] =
+    start(body, stack)
+
+/** A lock, and the one thing here most programs need.
+ *
+ * **`unlock` on a mutex this thread does not hold is undefined**, in libuv and in pthreads under it,
+ * and nothing checks it: the word it would cost is paid by every correct program. `with` is the
+ * shape that cannot get it wrong, and the pair is there for the case that cannot use it -- a lock
+ * held across a `Cond.wait`, or across the callback that drains a queue.
+ *
+ * **A plain mutex is not recursive.** Locking one twice from one thread deadlocks; `recursive_mutex`
+ * is the one that counts instead.
+ */
+struct Mutex
+    private storage: [c.MUTEX_WORDS]u64
+
+    private raw(*self) -> *c.Mutex = ptr_cast(&self.storage[0])
+
+    /** Wait until this thread holds the lock. */
+    lock(*self) = c.mutex_lock(self.raw())
+
+    /** Take the lock if it is free, and answer whether it was. Never waits. */
+    try_lock(*self) -> bool = c.mutex_trylock(self.raw()) == 0
+
+    /** Release the lock. Only the thread holding it may call this. */
+    unlock(*self) = c.mutex_unlock(self.raw())
+
+    /** Run `f` with the lock held, and answer what it answered.
+     *
+     * The lock is released however `f` finishes, which is what makes this the form to reach for:
+     * a `lock`/`unlock` pair with a `return` between them is the bug this call does not have.
+     */
+    with[R](*self, f: &Fn() -> R) -> R
+        self.lock()
+
+        val r = f()
+
+        self.unlock()
+        r
+
+    /** Release what libuv allocated for the lock. **Not for a lock anybody holds**, and not for one
+     * a `Cond` is still waiting on.
+     */
+    destroy(*self) = c.mutex_destroy(self.raw())
+end Mutex
+
+/** A lock nobody holds yet. `&sync` because a lock only one thread can reach is not a lock. */
+mutex() -> Result[&sync Mutex, Error]
+    var m: &sync Mutex = Mutex([0; c.MUTEX_WORDS])
+
+    checked(c.mutex_init(m.raw()))?
+    Ok(m)
+
+/** A lock the same thread may take more than once, releasing it as many times as it took it.
+ *
+ * What wants one is a call that may be reached both from inside the lock and from outside it. What
+ * usually wants one is a design that has not decided which, and the plain `mutex` is the better
+ * answer where it can be had.
+ */
+recursive_mutex() -> Result[&sync Mutex, Error]
+    var m: &sync Mutex = Mutex([0; c.MUTEX_WORDS])
+
+    checked(c.mutex_init_recursive(m.raw()))?
+    Ok(m)
+
+/** A condition to wait on: "the queue is not empty", "the run has finished".
+ *
+ * **A condition is not a flag and carries no state.** A `signal` nobody is waiting for is lost, which
+ * is why the mutex is part of the arrangement: the waiter takes the lock, tests the thing it is
+ * waiting for, and waits -- and `wait` releases the lock while it waits and has it again when it
+ * returns, so the signaller cannot slip between the test and the wait.
+ *
+ * **A wait may return without a signal**, which POSIX allows and calls a spurious wake-up. So the
+ * test is a loop rather than an `if`, always:
+ *
+ *     inbox.lock()
+ *
+ *     loop
+ *         if !queue.is_empty() then break
+ *
+ *         ready.wait(inbox)
+ *
+ *     val item = queue.pop()
+ *     inbox.unlock()
+ */
+struct Cond
+    private storage: [c.COND_WORDS]u64
+
+    private raw(*self) -> *c.Cond = ptr_cast(&self.storage[0])
+
+    /** Wake one waiter, if there is one. */
+    signal(*self) = c.cond_signal(self.raw())
+
+    /** Wake every waiter. What a "the run is over" condition wants, since every one of them has to
+     * hear it.
+     */
+    broadcast(*self) = c.cond_broadcast(self.raw())
+
+    /** Release `m` and wait, holding `m` again on the way back. The caller must hold `m`. */
+    wait(*self, m: &sync Mutex) = c.cond_wait(self.raw(), m.raw())
+
+    /** The same, giving up after `timeout` nanoseconds with `ETIMEDOUT`.
+     *
+     * **Nanoseconds**, which is libuv's unit here and not the milliseconds the timers take.
+     */
+    timed_wait(*self, m: &sync Mutex, timeout: u64) -> Result[unit, Error] =
+        checked(c.cond_timedwait(self.raw(), m.raw(), timeout))
+
+    /** Release what libuv allocated. Not for one anybody is waiting on. */
+    destroy(*self) = c.cond_destroy(self.raw())
+end Cond
+
+/** A condition nobody is waiting on yet. */
+cond() -> Result[&sync Cond, Error]
+    var cv: &sync Cond = Cond([0; c.COND_WORDS])
+
+    checked(c.cond_init(cv.raw()))?
+    Ok(cv)
+
+/** A count threads wait on -- permits, slots, or one thread telling another that a thing has
+ * happened.
+ *
+ * **Unlike a condition it remembers.** A `post` with nobody waiting raises the count, and the next
+ * `wait` takes it and returns immediately, which is what makes a semaphore the simple answer to
+ * "let me know when you have started".
+ */
+struct Semaphore
+    private storage: [c.SEM_WORDS]u64
+
+    private raw(*self) -> *c.Sem = ptr_cast(&self.storage[0])
+
+    /** Raise the count by one, releasing a waiter if there is one. Safe from any thread. */
+    post(*self) = c.sem_post(self.raw())
+
+    /** Wait until the count is above zero, then take one. */
+    wait(*self) = c.sem_wait(self.raw())
+
+    /** Take one if there is one, and answer whether there was. Never waits. */
+    try_wait(*self) -> bool = c.sem_trywait(self.raw()) == 0
+
+    /** Release what libuv allocated. Not for one anybody is waiting on. */
+    destroy(*self) = c.sem_destroy(self.raw())
+end Semaphore
+
+/** A semaphore starting at `value`, which is how many `wait`s may pass before one has to wait. */
+semaphore(value: u32 = 0) -> Result[&sync Semaphore, Error]
+    var s: &sync Semaphore = Semaphore([0; c.SEM_WORDS])
+
+    checked(c.sem_init(s.raw(), value))?
+    Ok(s)
+
+/** A lock that lets readers in together and writers in alone.
+ *
+ * What it is for is a thing read far more often than it is written -- a routing table, a
+ * configuration, a cache of something expensive. Where the two are anywhere near even, a `Mutex` is
+ * faster and much harder to get wrong.
+ *
+ * **Taking the write lock while holding the read lock deadlocks**, whichever thread does it, and
+ * upgrading is not something either libuv or pthreads offers.
+ */
+struct RwLock
+    private storage: [c.RWLOCK_WORDS]u64
+
+    private raw(*self) -> *c.RwLock = ptr_cast(&self.storage[0])
+
+    /** Wait until no writer holds the lock, then read alongside any other reader. */
+    read_lock(*self) = c.rwlock_rdlock(self.raw())
+
+    /** Take the read lock if a writer does not hold it. Never waits. */
+    try_read_lock(*self) -> bool = c.rwlock_tryrdlock(self.raw()) == 0
+
+    /** Release the read lock. */
+    read_unlock(*self) = c.rwlock_rdunlock(self.raw())
+
+    /** Wait until nobody holds the lock at all, then hold it alone. */
+    write_lock(*self) = c.rwlock_wrlock(self.raw())
+
+    /** Take the write lock if nobody holds the lock at all. Never waits. */
+    try_write_lock(*self) -> bool = c.rwlock_trywrlock(self.raw()) == 0
+
+    /** Release the write lock. */
+    write_unlock(*self) = c.rwlock_wrunlock(self.raw())
+
+    /** Run `f` with the read lock held, and answer what it answered. */
+    reading[R](*self, f: &Fn() -> R) -> R
+        self.read_lock()
+
+        val r = f()
+
+        self.read_unlock()
+        r
+
+    /** Run `f` with the write lock held, and answer what it answered. */
+    writing[R](*self, f: &Fn() -> R) -> R
+        self.write_lock()
+
+        val r = f()
+
+        self.write_unlock()
+        r
+
+    /** Release what libuv allocated. Not for a lock anybody holds. */
+    destroy(*self) = c.rwlock_destroy(self.raw())
+end RwLock
+
+/** A reader/writer lock nobody holds yet. */
+rwlock() -> Result[&sync RwLock, Error]
+    var l: &sync RwLock = RwLock([0; c.RWLOCK_WORDS])
+
+    checked(c.rwlock_init(l.raw()))?
+    Ok(l)
+
+/** A meeting point for a known number of threads: every one of them waits until the last arrives.
+ *
+ * **It is for a phase rather than for a queue** -- every worker has filled its part of the array,
+ * so the next phase may read all of it. A barrier waiting for a thread that has already finished
+ * waits for ever, so the count has to be the number that really will arrive.
+ */
+struct Barrier
+    private storage: [c.BARRIER_WORDS]u64
+
+    private raw(*self) -> *c.Barrier = ptr_cast(&self.storage[0])
+
+    /** Wait for the rest of them.
+     *
+     * **`true` for exactly one of the threads**, chosen by libuv, and that one is the thread that
+     * may `destroy` the barrier -- which is libuv's own rule and the only safe moment to do it,
+     * since the others are still inside their own `wait` until then.
+     */
+    wait(*self) -> Result[bool, Error]
+        val r = c.barrier_wait(self.raw())
+
+        if r < 0 then Err(Error(r)) else Ok(r > 0)
+
+    /** Release what libuv allocated. Only the thread whose `wait` answered `true`. */
+    destroy(*self) = c.barrier_destroy(self.raw())
+end Barrier
+
+/** A barrier that opens when `count` threads have reached it. */
+barrier(count: u32) -> Result[&sync Barrier, Error]
+    var b: &sync Barrier = Barrier([0; c.BARRIER_WORDS])
+
+    checked(c.barrier_init(b.raw(), count))?
+    Ok(b)

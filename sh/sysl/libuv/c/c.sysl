@@ -76,6 +76,20 @@ opaque struct StdioContainer
 // read as; nothing in the layer above uses it yet.
 opaque struct Dir
 
+// The threading primitives, which are the operating system's own structures under libuv's names —
+// `pthread_t` and the four pthreads objects here, and the Win32 equivalents there. Every one is
+// sized below and none of them is a handle: nothing in this group belongs to a loop.
+//
+// **`ThreadId` is `uv_thread_t`, which is a VALUE** — it is copied, compared with `thread_equal`,
+// and answered by value from `uv_thread_self`, which is the one call in the group the shim has to
+// reach. The rest of them are storage the caller finds, exactly as a handle is.
+opaque struct ThreadId
+opaque struct Mutex
+opaque struct RwLock
+opaque struct Sem
+opaque struct Cond
+opaque struct Barrier
+
 // ## The structs libuv defines itself
 //
 // These three are libuv's own layout on every platform — it normalises what the operating system
@@ -207,6 +221,67 @@ extern "uv_req_set_data" req_set_data(r: *Req, data: *u8)
 
 extern "uv_queue_work" queue_work(l: *Loop, req: *Work, work_cb: *extern(*Work) -> unit,
                                   after_work_cb: *extern(*Work, i32) -> unit) -> i32
+
+// ## Threads, and the locks that go with them
+//
+// libuv's portable threading: pthreads on Unix, the Win32 equivalents on Windows, one name for
+// both. **None of it touches a loop.** A thread here is an ordinary operating-system thread, and
+// what it does with a loop of its own is the layer above's business rather than this group's.
+//
+// `uv_thread_cb` is `void (*)(void *)` — one word of code and a `void *` beside it, like every other
+// callback in this file.
+//
+// **The calls that answer nothing cannot fail and the ones that answer an `int` can**, which is
+// libuv's own division and is why `mutex_lock` returns `unit` where `mutex_trylock` returns a code.
+// `uv_mutex_unlock` on a mutex this thread does not hold is undefined rather than an error.
+
+extern "uv_thread_create" thread_create(tid: *ThreadId, entry: *extern(*u8) -> unit, arg: *u8) -> i32
+extern "sysl_uv_thread_create_ex" thread_create_ex(tid: *ThreadId, flags: u32, stack_size: usize,
+                                                   entry: *extern(*u8) -> unit, arg: *u8) -> i32
+extern "uv_thread_join" thread_join(tid: *ThreadId) -> i32
+extern "uv_thread_equal" thread_equal(a: *ThreadId, b: *ThreadId) -> i32
+extern "sysl_uv_thread_self" thread_self(out: *ThreadId)
+extern "uv_thread_setname" thread_setname(name: *u8) -> i32
+extern "uv_thread_getname" thread_getname(tid: *ThreadId, name: *u8, size: usize) -> i32
+
+extern "uv_mutex_init" mutex_init(m: *Mutex) -> i32
+extern "uv_mutex_init_recursive" mutex_init_recursive(m: *Mutex) -> i32
+extern "uv_mutex_destroy" mutex_destroy(m: *Mutex)
+extern "uv_mutex_lock" mutex_lock(m: *Mutex)
+extern "uv_mutex_trylock" mutex_trylock(m: *Mutex) -> i32
+extern "uv_mutex_unlock" mutex_unlock(m: *Mutex)
+
+extern "uv_rwlock_init" rwlock_init(l: *RwLock) -> i32
+extern "uv_rwlock_destroy" rwlock_destroy(l: *RwLock)
+extern "uv_rwlock_rdlock" rwlock_rdlock(l: *RwLock)
+extern "uv_rwlock_tryrdlock" rwlock_tryrdlock(l: *RwLock) -> i32
+extern "uv_rwlock_rdunlock" rwlock_rdunlock(l: *RwLock)
+extern "uv_rwlock_wrlock" rwlock_wrlock(l: *RwLock)
+extern "uv_rwlock_trywrlock" rwlock_trywrlock(l: *RwLock) -> i32
+extern "uv_rwlock_wrunlock" rwlock_wrunlock(l: *RwLock)
+
+extern "uv_sem_init" sem_init(s: *Sem, value: u32) -> i32
+extern "uv_sem_destroy" sem_destroy(s: *Sem)
+extern "uv_sem_post" sem_post(s: *Sem)
+extern "uv_sem_wait" sem_wait(s: *Sem)
+extern "uv_sem_trywait" sem_trywait(s: *Sem) -> i32
+
+extern "uv_cond_init" cond_init(cv: *Cond) -> i32
+extern "uv_cond_destroy" cond_destroy(cv: *Cond)
+extern "uv_cond_signal" cond_signal(cv: *Cond)
+extern "uv_cond_broadcast" cond_broadcast(cv: *Cond)
+extern "uv_cond_wait" cond_wait(cv: *Cond, m: *Mutex)
+extern "uv_cond_timedwait" cond_timedwait(cv: *Cond, m: *Mutex, timeout: u64) -> i32
+
+extern "uv_barrier_init" barrier_init(b: *Barrier, count: u32) -> i32
+extern "uv_barrier_destroy" barrier_destroy(b: *Barrier)
+extern "uv_barrier_wait" barrier_wait(b: *Barrier) -> i32
+
+// The one flag `uv_thread_create_ex` takes, and the reason it is here rather than in
+// `constants.sysl`: no program spells it. The layer above asks for a stack size and sets the flag
+// that makes libuv read it.
+c const
+    THREAD_HAS_STACK_SIZE: u32 = "UV_THREAD_HAS_STACK_SIZE"
 
 // ## Timer
 
@@ -442,6 +517,7 @@ extern "sysl_uv_ai_family" ai_family(ai: *AddrInfo) -> i32
 extern "sysl_uv_ai_socktype" ai_socktype(ai: *AddrInfo) -> i32
 extern "sysl_uv_ai_protocol" ai_protocol(ai: *AddrInfo) -> i32
 extern "sysl_uv_ai_addr" ai_addr(ai: *AddrInfo) -> *SockAddr
+extern "sysl_uv_ai_addrlen" ai_addrlen(ai: *AddrInfo) -> usize
 extern "sysl_uv_ai_canonname" ai_canonname(ai: *AddrInfo) -> *u8
 
 extern "sysl_uv_ignore_sigpipe" ignore_sigpipe()
@@ -482,6 +558,13 @@ c const
     FS_WORDS: usize = "(sizeof(uv_fs_t) + 7) / 8"
     GETADDRINFO_WORDS: usize = "(sizeof(uv_getaddrinfo_t) + 7) / 8"
     WORK_WORDS: usize = "(sizeof(uv_work_t) + 7) / 8"
+
+    THREAD_WORDS: usize = "(sizeof(uv_thread_t) + 7) / 8"
+    MUTEX_WORDS: usize = "(sizeof(uv_mutex_t) + 7) / 8"
+    RWLOCK_WORDS: usize = "(sizeof(uv_rwlock_t) + 7) / 8"
+    SEM_WORDS: usize = "(sizeof(uv_sem_t) + 7) / 8"
+    COND_WORDS: usize = "(sizeof(uv_cond_t) + 7) / 8"
+    BARRIER_WORDS: usize = "(sizeof(uv_barrier_t) + 7) / 8"
 
     BUF_WORDS: usize = "(sizeof(uv_buf_t) + 7) / 8"
     SOCKADDR_WORDS: usize = "(sizeof(struct sockaddr_storage) + 7) / 8"

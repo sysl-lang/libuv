@@ -4,10 +4,15 @@
 // second thread is undefined. `send` is the exception: it is safe from anywhere, and it is how a
 // worker thread gets the loop's attention.
 //
-//     val wake = notifier(() -> drain_the_results())?
+//     val a = notifier(() -> drain_the_results())?
+//     val wake = a.waker()
 //
 //     // ... on another thread, whenever there is something to drain:
 //     wake.send()
+//
+// **What crosses is the waker rather than the handle.** A handle is a `&T` and a thread's body may
+// not capture one; a waker is an address, which copies into a body the way an integer does. The
+// handle has to outlive it, and a thread that owns both has that by construction.
 //
 // **Sends coalesce.** libuv promises the callback runs at least once after a `send`, not once per
 // `send` -- several sends before the loop next turns produce one call. So the callback's job is to
@@ -38,7 +43,30 @@ struct Async
      * reason this handle exists.
      */
     send(*self) -> Result[unit, Error] = checked(c.async_send(self.raw()))
+
+    /** A `send` on its own, as a value another thread may be given.
+     *
+     * **A handle is a `&T` and a thread's body may not capture one** -- that is the rule every
+     * callback in this package is written under, and it is the compiler's rather than this
+     * package's. A waker is an address and nothing else, so it copies into a body the way an
+     * integer does, and `uv_async_send` is the one libuv call that is safe from any thread at all.
+     *
+     * **The handle has to outlive the waker.** Nothing counts here: a waker used after the handle
+     * it came from was closed is the use-after-free it would be in C. The ordinary arrangement --
+     * the thread owns the loop and the handle, and closes both before it returns -- has the handle
+     * outliving every waker by construction.
+     */
+    waker(*self) -> Waker = Waker(usize(self.raw()))
 end Async
+
+/** An address a `send` may be made from. See `Async.waker`, which is the only thing that makes one.
+ */
+struct Waker
+    private p: usize
+
+    /** Wake the loop and have its callback run. **Safe from any thread**, and the whole point. */
+    send(self) -> Result[unit, Error] = checked(c.async_send(ptr_cast(self.p)))
+end Waker
 
 impl Handle for Async
     handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])

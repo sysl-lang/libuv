@@ -44,6 +44,8 @@ int sysl_uv_ai_protocol(const struct addrinfo *ai) { return ai->ai_protocol; }
 
 const struct sockaddr *sysl_uv_ai_addr(const struct addrinfo *ai) { return ai->ai_addr; }
 
+size_t sysl_uv_ai_addrlen(const struct addrinfo *ai) { return (size_t)ai->ai_addrlen; }
+
 const char *sysl_uv_ai_canonname(const struct addrinfo *ai) { return ai->ai_canonname; }
 
 void sysl_uv_ignore_sigpipe(void) { signal(SIGPIPE, SIG_IGN); }
@@ -60,4 +62,17 @@ void sysl_uv_stdio_set_fd(uv_stdio_container_t *stdio, int i, int flags, int fd)
 void sysl_uv_stdio_set_stream(uv_stdio_container_t *stdio, int i, int flags, uv_stream_t *stream) {
   stdio[i].flags = (uv_stdio_flags)flags;
   stdio[i].data.stream = stream;
+}
+
+void sysl_uv_thread_self(uv_thread_t *out) { *out = uv_thread_self(); }
+
+int sysl_uv_thread_create_ex(uv_thread_t *tid, unsigned int flags, size_t stack_size,
+                             uv_thread_cb entry, void *arg) {
+  uv_thread_options_t options;
+
+  memset(&options, 0, sizeof(options));
+  options.flags = flags;
+  options.stack_size = stack_size;
+
+  return uv_thread_create_ex(tid, &options, entry, arg);
 }
