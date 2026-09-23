@@ -368,6 +368,12 @@ loop_idle_time()
 
     val t2 = timer(measured).expect("a timer")
 
+    // A timer's due time is counted from the loop's *cached* clock, which was read at `new_loop`.
+    // The stall stands in for a loaded machine: without `update_time` the timer is already due
+    // when `run` starts, the loop never waits, and there is no idle time to measure.
+    sleep(10)
+    measured.update_time()
+
     t2.start(5, 0, () -> t2.close()).expect("started")
     measured.run().expect("the loop ran")
 
