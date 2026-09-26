@@ -5,7 +5,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.7" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.8" }
 }
 ```
 
@@ -544,24 +544,24 @@ option; `Pipe.chmod` takes `READABLE`/`WRITABLE` and not the stdio flags of near
 `hrtime` does not share a base with `clock(CLOCK_MONOTONIC)` — seven seconds apart on this machine;
 and a write to a peer that has gone ends the process unless `ignore_sigpipe` was called.
 
-An eighth was a compiler bug rather than a mistake here: rendering an `AddrInfo` segfaulted, because
-**a struct over 128 bytes cannot be rendered through `str` or `s"$x"` at all** while `print` of one
-works. That is card `0305`; `AddrInfo` has no `Display` until it closes, and a test asserts `Address`
-stays under the limit so that a platform with a bigger `sockaddr_storage` fails rather than crashes.
+An eighth was a compiler bug rather than a mistake here: rendering an `AddrInfo` used to segfault,
+because a struct over 128 bytes could not be rendered through `str` or `s"$x"` at all while `print` of
+one worked. That was card `0305`, fixed in sysl 0.0.83; `AddrInfo` has a `Display` now, and a test
+covers it directly.
 
-## Two compiler bugs this package works around
+## Two compiler bugs this package used to work around
 
-Both are the same 128-byte boundary, which is where a value stops being passed and returned directly.
+Both were the same 128-byte boundary, which is where a value stops being passed and returned
+directly, and both were fixed in sysl 0.0.83 — this package's floor, so neither workaround is in the
+source any more.
 
-**Card `0304`** — a `?` in a function whose result is larger than 128 bytes emits a direct return out
-of a function the ABI made `void`, and clang refuses the compiler's own IR. So the functions
-answering with an `Address` or a `Stat` are written without `?`; the comment at each site says so,
-and nothing about the interface is affected.
+**Card `0304`** — a `?` in a function whose result was larger than 128 bytes emitted a direct return
+out of a function the ABI made `void`, and clang refused the compiler's own IR. `ip4` and `ip6`, which
+answer an `Address`, now use `?` like everything else.
 
-**Card `0305`** — a struct over 128 bytes cannot implement `Display` usefully: `str(x)` and `s"$x"`
-segfault with no diagnostic, while `print(x)` works, and the receiver cannot be taken by reference
-because the trait fixes it. So `AddrInfo` has no `Display` — render the `Address` inside it — and a
-test pins `sizeof(Address)` at or under the limit.
+**Card `0305`** — a struct over 128 bytes could not implement `Display` usefully: `str(x)` and
+`s"$x"` segfaulted with no diagnostic, while `print(x)` worked. `AddrInfo` now has a `Display`,
+rendering its address and, when the resolver was asked for one, its canonical name.
 
 ## License
 

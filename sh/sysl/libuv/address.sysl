@@ -43,11 +43,6 @@ struct Address
         from_cstring(&buf[0]).unwrap_or("")
 end Address
 
-// **`Address` is exactly 128 bytes and that is the limit**, because a struct over it cannot be
-// rendered at all through `str` or `s"$x"` -- card `0305`. `tests.sysl` asserts the size rather than
-// leaving a platform with a larger `sockaddr_storage` to segfault, and this `impl` is why it
-// matters.
-
 /** An address renders the way a person writes one: `host:port`, with a v6 host in brackets so that
  * the colons in it are not read as the separator.
  */
@@ -71,9 +66,10 @@ impl Eq for Address
 ip4(host: string, port: int) -> Result[Address, Error]
     var a = Address([0; c.SOCKADDR_WORDS])
     val h = cstring(host)
-    val r = c.ip4_addr(h.ptr, i32(port), a.raw())
 
-    if r < 0 then Err(Error(r)) else Ok(a)
+    checked(c.ip4_addr(h.ptr, i32(port), a.raw()))?
+
+    Ok(a)
 
 /** An IPv6 address and a port, with the same rule: text only, no lookup. A scope may be written the
  * way the platform writes one, `fe80::1%en0`.
@@ -81,9 +77,10 @@ ip4(host: string, port: int) -> Result[Address, Error]
 ip6(host: string, port: int) -> Result[Address, Error]
     var a = Address([0; c.SOCKADDR_WORDS])
     val h = cstring(host)
-    val r = c.ip6_addr(h.ptr, i32(port), a.raw())
 
-    if r < 0 then Err(Error(r)) else Ok(a)
+    checked(c.ip6_addr(h.ptr, i32(port), a.raw()))?
+
+    Ok(a)
 
 /** An address of either family, decided by whether the text parses as one. This is what a program
  * reading a host out of a configuration file wants, since it need not care which it was given.
@@ -92,13 +89,6 @@ ip(host: string, port: int) -> Result[Address, Error]
     ip4(host, port) match
         Ok(a) -> Ok(a)
         Err(_) -> ip6(host, port)
-
-// **The two above are written without `?` on purpose, and it is a workaround.** An `Address` is a
-// `sockaddr_storage`, which is 128 bytes here -- and a `?` in a function whose result is that large
-// is returned through an `sret` out-parameter while the early return `?` emits is written as a
-// direct one. clang refuses the IR, naming a temporary file and the word `void`, which reads as a
-// toolchain fault rather than as anything to do with the sysl. Card `0304`; put the `?` back when it
-// closes.
 
 // Storage for an address libuv is about to fill in -- a peer's, or the local end of a socket.
 private[libuv] blank_address() -> Address = Address([0; c.SOCKADDR_WORDS])

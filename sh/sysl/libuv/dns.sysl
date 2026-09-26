@@ -30,14 +30,16 @@ struct AddrInfo
     protocol: i32
     canonical: string
 
-// **`AddrInfo` deliberately does NOT implement `Display`, and it is a compiler bug rather than a
-// choice.** A struct over 128 bytes cannot be rendered through `str` or through `s"$x"` -- both
-// segfault, with no diagnostic, while `print(x)` straight to the sink works -- and an `AddrInfo` is
-// a 128-byte address plus its three integers and a name. The receiver cannot be taken by reference
-// to dodge it, because `Display` fixes the receiver.
-//
-// Card `0305`. Render `a.address` instead, which is exactly 128 bytes and is what a program wanted
-// anyway; put the `impl` back when the card closes.
+/** The address, followed by the canonical name in parentheses when the resolver was asked for one
+ * and found it.
+ */
+impl Display for AddrInfo
+    display(self, out: *Writer, fmt: FormatSpec)
+        var text = s"${self.address}"
+
+        if self.canonical != "" then text = s"${self.address} (${self.canonical})"
+
+        display_str(text, out, fmt)
 
 // The request, its hints, and the callback, all alive until libuv answers.
 private struct Lookup

@@ -193,15 +193,6 @@ unref_lets_the_loop_end()
 
 // -- Addresses ------------------------------------------------------------------------------------
 
-// **A struct over 128 bytes cannot be rendered through `str` or `s"$x"`** -- card `0305`, where both
-// segfault with no diagnostic. `Address` is exactly 128 here and its `Display` works; on a platform
-// whose `sockaddr_storage` is larger it would not, and this is what makes that a failing test rather
-// than a crash in somebody's log line.
-@test("an address is small enough to be rendered at all")
-address_fits_under_the_display_limit()
-    assert(sizeof(Address) <= 128, "over 128 bytes, str() and interpolation segfault -- card 0305")
-    assert_eq(s"${ip4("1.2.3.4", 5).unwrap()}", "1.2.3.4:5")
-
 @test("an address is parsed, and reads back as what was written")
 addresses()
     val a = ip4("127.0.0.1", 8080).expect("a v4 address")
@@ -238,6 +229,15 @@ address_equality()
     assert_eq(ip4("1.2.3.4", 9).unwrap(), ip4("1.2.3.4", 9).unwrap())
     assert(ip4("1.2.3.4", 9).unwrap() != ip4("1.2.3.4", 10).unwrap(), "the port counts")
     assert(ip4("1.2.3.4", 9).unwrap() != ip4("1.2.3.5", 9).unwrap(), "and so does the host")
+
+@test("an AddrInfo renders its address, and its canonical name when it has one")
+addrinfo_display()
+    val a = ip4("127.0.0.1", 80).expect("an address")
+    val plain = AddrInfo(a, AF_INET, SOCK_STREAM, 0, "")
+    val named = AddrInfo(a, AF_INET, SOCK_STREAM, 0, "example.com")
+
+    assert_eq(s"$plain", "127.0.0.1:80")
+    assert_eq(s"$named", "127.0.0.1:80 (example.com)")
 
 // -- TCP ------------------------------------------------------------------------------------------
 
@@ -419,10 +419,7 @@ resolve_localhost()
         r match
             Ok(list) ->
                 found.count = list.len
-
-                // Rendering the *address* rather than the `AddrInfo` around it, which is what
-                // card `0305` forces and what a program wants regardless.
-                found.first = s"${list[0].address}"
+                found.first = s"${list[0]}"
             Err(e) -> found.code = e.code, AF_INET, SOCK_STREAM, 0, lp).expect("the lookup started")
 
     assert(!found.done, "nothing has been answered before the loop runs")
