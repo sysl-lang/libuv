@@ -80,4 +80,11 @@ void sysl_uv_thread_self(uv_thread_t *out);
 int sysl_uv_thread_create_ex(uv_thread_t *tid, unsigned int flags, size_t stack_size,
                              uv_thread_cb entry, void *arg);
 
+/* The system's default search path, `confstr(_CS_PATH)` -- where `execvp` looks in a process with no
+ * `PATH`, and so where a child given an environment of its own with no `PATH` in it is looked for.
+ * A macro names it, which is why it is here.  The answer is `confstr`'s: the size the whole string
+ * needs with its terminator, written into `buf` as far as `size` allows, and 0 where the platform
+ * has no such path. */
+size_t sysl_uv_default_path(char *buf, size_t size);
+
 #endif /* SYSL_UV_SHIM_H */

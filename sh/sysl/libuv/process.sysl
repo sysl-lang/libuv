@@ -50,8 +50,8 @@ module sh.sysl.libuv
 
 import sh.sysl.libuv.c
 import sysl.buf.{Buf, buf}
-import sysl.slices.as_mut_ptr
-import sysl.text.{CString, cstring}
+import sysl.slices.{as_ptr, as_mut_ptr}
+import sysl.text.{CString, Search, cstring, from_cstring, split}
 
 /** What one of the child's descriptors is. */
 enum Stdio
@@ -144,16 +144,36 @@ private process_exited(h: *c.Process, status: i64, signal: i32) -> unit
  * what a program that is not there answers with, reported from this call rather than from the
  * callback.
  *
- * `cwd` of `""` means the child starts where this process is. `env` of an empty list means it
- * inherits this process's environment; anything else replaces it entirely, and each entry is
- * `"NAME=value"`.
+ * `cwd` of `""` means the child starts where this process is.
+ *
+ * `env` is a list of `"NAME=value"` entries, and **what it means is `inherit_env`'s to say**:
+ *
+ * | | `env` empty | `env` given |
+ * |---|---|---|
+ * | `inherit_env = true`, the default | the child inherits this process's environment | `env` **replaces** it entirely |
+ * | `inherit_env = false` | the child has **no environment at all** | `env` is the child's whole environment |
+ *
+ * The default is how this function has always behaved, so the one thing `false` adds is the empty
+ * environment -- which `true` cannot express, an empty list being its way of saying "inherit". Note
+ * that a given list *replaces* rather than adds under either setting: that is libuv's meaning for a
+ * non-null `env`, where `sysl.process`'s default adds.
+ *
+ * **`PATH` decides where `file` is looked for, before the child exists.** A `PATH` among the
+ * entries is searched, as `execvp` in the child would search it -- so a caller handing a child a
+ * `PATH` meant for *its* children names the program by an absolute path. **A child given an
+ * environment with no `PATH` in it** is looked for on the system's default search path,
+ * `confstr(_CS_PATH)` (`/usr/bin:/bin:/usr/sbin:/sbin` on macOS, `/bin:/usr/bin` on glibc) -- never
+ * on this process's own `PATH`, the child having been asked to inherit nothing. That is
+ * `sysl.process`'s rule with `inherit_env = false`. With `inherit_env = true` and a non-empty list
+ * without a `PATH`, libuv's own fallback stands, unchanged: `/usr/bin:/bin` on macOS, glibc's
+ * default on Linux.
  *
  * `flags` takes `PROCESS_DETACHED`, which lets the child outlive this process -- and note that it
  * still keeps the loop alive until the handle is `unref`ed.
  */
 spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []const Stdio = [],
       cwd: string = "", env: []const string = [], flags: u32 = 0,
-      lp: &Loop = default_loop()) -> Result[&Process, Error]
+      lp: &Loop = default_loop(), inherit_env: bool = true) -> Result[&Process, Error]
     val count = if stdio.len == 0 then 3 else stdio.len
 
     var p: &Process = Process([0; c.PROCESS_WORDS], lp, None, cb, noop, buf(), [null; 0], [null; 0],
@@ -170,9 +190,10 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
 
     p.argv = argv
 
-    // The environment, if it is being replaced. An empty list leaves the pointer null, which is
-    // what libuv reads as "inherit".
-    if env.len > 0
+    // The environment, if it is being replaced. An empty list under `inherit_env` leaves the pointer
+    // null, which is what libuv reads as "inherit"; an empty list without it is an array holding
+    // only the null that ends it, which is an environment with nothing in it.
+    if env.len > 0 || !inherit_env
         val first = p.strings.len()
 
         for e in env do p.strings.push(cstring(e))
@@ -182,6 +203,18 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
         for i in 0..<env.len do envp[i] = p.strings.at(first + i).ptr
 
         p.envp = envp
+
+    // What libuv is asked to execute. argv[0] stays the name the caller wrote; only the path the
+    // program is loaded from changes, and only for a child that inherits nothing and was given no
+    // `PATH` -- libuv would otherwise look on a fallback of its own that differs from the system's.
+    var exe = p.strings.at(0).ptr
+
+    if !inherit_env
+        on_default_path(file, env) match
+            Some(full) ->
+                p.strings.push(cstring(full))
+                exe = p.strings.at(p.strings.len() - 1).ptr
+            None -> ()
 
     val dir = cstring(cwd)
     val containers: *c.StdioContainer = ptr_cast(as_mut_ptr(p.stdio))
@@ -201,7 +234,7 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
 
             i += 1
 
-    var options = c.ProcessOptions(&process_exited, p.strings.at(0).ptr, as_mut_ptr(p.argv),
+    var options = c.ProcessOptions(&process_exited, exe, as_mut_ptr(p.argv),
                                    as_mut_ptr(p.envp), if cwd == "" then null else dir.ptr, flags,
                                    i32(count), containers, 0, 0)
 
@@ -229,6 +262,38 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
         return Err(err)
 
     Ok(p)
+
+// Where a bare program name is found on the system's default search path, for a child whose
+// environment carries no `PATH` of its own. `None` hands the name to libuv as written: a name with
+// a slash is a path rather than a name, a `PATH` among the entries is libuv's to search, and a name
+// the default path does not hold is one libuv's own fallback (a subset of it) will not find either,
+// so the failure is still the `ENOENT` it has always been.
+private on_default_path(file: string, env: []const string) -> Option[string]
+    if file == "" || file.index_of_byte(u8('/')).is_some() then return None
+
+    for e in env
+        if e.starts_with("PATH=") then return None
+
+    val size = c.default_path(null, 0)
+
+    if size == 0 then return None
+
+    var bytes: []u8 = [0; size]
+
+    c.default_path(as_mut_ptr(bytes), size)
+
+    val dirs = from_cstring(as_ptr(bytes)).unwrap_or("")
+
+    for dir in split(dirs, ":")
+        if dir != ""
+            val candidate = dir + "/" + file
+
+            stat_sync(candidate) match
+                Ok(st) ->
+                    if st.is_file() && access_sync(candidate, X_OK).is_ok() then return Some(candidate)
+                Err(_) -> ()
+
+    None
 
 /** Stop the child processes this program starts from inheriting its descriptors, from this point
  * on. What a program calls at startup when it is going to spawn things and does not want them

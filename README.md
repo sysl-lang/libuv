@@ -5,7 +5,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.8" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.9" }
 }
 ```
 
@@ -129,6 +129,7 @@ sysl cannot:
 The rest are the calls whose **signature** has no sysl spelling: `uv_loop_configure`, which is
 variadic; `uv_thread_self`, which answers with a platform type by value; and `uv_thread_create_ex`,
 whose options struct is positional — its stack size is read only when the flag asking for it is set.
+Beside them is `confstr(_CS_PATH)`, the system's default search path, which a macro names.
 
 Sizes are not answered there: a `c const` block measures `sizeof` for the target being built for,
 which is the same answer with nothing to keep in step. `tests.sysl` checks each measured size against
@@ -454,6 +455,36 @@ and the one thing here that is easy to get backwards: a pipe the parent *reads* 
 
 The child is reaped by the loop, which is what `SIGCHLD` handling would otherwise be for.
 
+### The child's environment
+
+`env` is a list of `"NAME=value"` entries, and the last parameter, `inherit_env: bool = true`, says
+what it means:
+
+| | `env` empty | `env` given |
+|---|---|---|
+| `inherit_env = true`, the default | the child inherits this process's environment | `env` **replaces** it entirely |
+| `inherit_env = false` | the child has **no environment at all** | `env` is the child's whole environment |
+
+The default is what `spawn` has always done, so a call written before the parameter existed means
+what it meant. What `false` adds is the empty environment, which `true` cannot express — an empty list
+is its way of saying "inherit". A given list *replaces* under either setting, which is libuv's meaning
+for a non-null `env`; `sysl.process`'s default *adds* instead.
+
+```sysl
+spawn("/usr/bin/env", [], on_exit, [], "", [], 0, default_loop(), false)?        // prints nothing
+spawn("env", [], on_exit, [], "", ["LANG=C"], 0, default_loop(), false)?         // LANG=C, alone
+```
+
+**`PATH` decides where the program is looked for, before the child exists.** A `PATH` among the
+entries is searched, as `execvp` in the child would search it, so a `PATH` meant for the child's own
+children wants the program named by an absolute path. **A child given an environment with no `PATH`**
+is looked for on the system's default path, `confstr(_CS_PATH)` — `/usr/bin:/bin:/usr/sbin:/sbin` on
+macOS, `/bin:/usr/bin` on glibc — and never on this process's `PATH`: that is `sysl.process`'s rule
+with `inherit_env = false`. libuv's own fallback is narrower on macOS (`/usr/bin:/bin`, so `sysctl`
+is not found), which is why `spawn` resolves the name itself in that one case and hands libuv the
+full path, leaving `argv[0]` as written. With `inherit_env = true` and a list holding no `PATH`, the
+fallback is libuv's, as it always was. A program found nowhere is `ENOENT` from the call either way.
+
 ## Installing libuv
 
 ```
@@ -480,14 +511,14 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and forty-eight of them, over eight files, and every public entry point but one is exercised
+**A hundred and fifty-six of them, over eight files, and every public entry point but one is exercised
 by one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
 macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
 binding, and a test runner has no controlling terminal to use instead. It says so at the site.
 
 **The whole raw layer is exercised too**, which is a separate file: a declaration nothing calls is a
 declaration nothing checks, and a signature that disagrees with `uv.h` links perfectly and corrupts
-the call at run time. Every one of the 223 `extern`s is now reached, from the pleasant layer or from
+the call at run time. Every one of the 224 `extern`s is now reached, from the pleasant layer or from
 `raw_tests.sysl` directly. `uv_cancel` was the one exception until the thread pool arrived — it may
 only be called on a request still in flight, and on a finished one it faults, so there was nothing
 safe to call it from. `Work.cancel` is that caller now, because a request knows whether it is still

@@ -7,7 +7,9 @@ module sh.sysl.libuv
 // a number: what is checked is that the answers are internally consistent, that the two clocks agree
 // with each other, and that the calls which change process state change it and change it back.
 
-import sysl.text.from_utf8
+import sh.sysl.libuv.c
+import sysl.slices.as_mut_ptr
+import sysl.text.{Search, from_utf8}
 
 // -- Clocks -------------------------------------------------------------------------------------
 
@@ -207,6 +209,126 @@ child_environment()
     assert_eq(got.text, dir + "\n")
 
     rmdir_sync(dir).expect("removed")
+
+// -- What a child's environment is: `inherit_env` -------------------------------------------------
+//
+// `env` prints its environment one variable to a line in the order it holds them, so what it prints
+// is the whole of the answer. It is run by absolute path except where the lookup is the question.
+
+@test("a child that inherits nothing and is given nothing has an empty environment")
+empty_environment()
+    assert_eq(captured("/usr/bin/env", [], [], false).expect("it ran"), "")
+
+@test("a child that inherits nothing has exactly the variables it is given")
+given_environment_only()
+    set_env("SYSL_LIBUV_PARENT_ONLY", "yes").expect("set")
+
+    val got = captured("/usr/bin/env", [], ["A=1", "B=two"], false).expect("it ran")
+
+    unset_env("SYSL_LIBUV_PARENT_ONLY").expect("unset")
+
+    assert_eq(got, "A=1\nB=two\n")
+
+@test("by default an empty list still inherits this process's environment")
+default_empty_inherits()
+    set_env("SYSL_LIBUV_PARENT_ONLY", "yes").expect("set")
+
+    val got = captured("/usr/bin/env", [], [], true).expect("it ran")
+
+    unset_env("SYSL_LIBUV_PARENT_ONLY").expect("unset")
+
+    assert(got.contains("SYSL_LIBUV_PARENT_ONLY=yes\n"), "the parent's variable reached the child")
+
+@test("by default a given list still replaces the environment rather than adding to it")
+default_given_replaces()
+    set_env("SYSL_LIBUV_PARENT_ONLY", "yes").expect("set")
+
+    val got = captured("/usr/bin/env", [], ["ONLY=this"], true).expect("it ran")
+
+    unset_env("SYSL_LIBUV_PARENT_ONLY").expect("unset")
+
+    assert_eq(got, "ONLY=this\n")
+
+@test("a bare name for a child given no PATH is found on the system's default path")
+bare_name_on_the_default_path()
+    // `env` is in `/usr/bin`, which every platform's default path holds.
+    assert_eq(captured("env", [], [], false).expect("it was found"), "")
+
+// The case that tells the system's default path from libuv's own fallback: macOS's `confstr`
+// answers `/usr/bin:/bin:/usr/sbin:/sbin` where libuv falls back to `/usr/bin:/bin`, and `sysctl`
+// lives only in `/usr/sbin`. On a machine without that arrangement there is nothing to tell apart.
+@test("the default path is the system's, not libuv's narrower fallback")
+default_path_is_the_systems()
+    val size = c.default_path(null, 0)
+
+    if size == 0 then return
+
+    var bytes: []u8 = [0; size]
+
+    c.default_path(as_mut_ptr(bytes), size)
+
+    val dirs = from_utf8(bytes[0..<size - 1]).unwrap_or("")
+    val sbin = stat_sync("/usr/sbin/sysctl").is_ok() && stat_sync("/usr/bin/sysctl").is_err() &&
+        stat_sync("/bin/sysctl").is_err()
+
+    if sbin && (dirs + ":").contains("/usr/sbin:")
+        assert(captured("sysctl", ["-n", "kern.ostype"], [], false).is_ok(), "found in /usr/sbin")
+
+        // The same name with `inherit_env` and a list holding no `PATH` is left to libuv, whose
+        // fallback does not hold `/usr/sbin` -- unchanged, and what the new rule exists to fix.
+        assert_eq(captured("sysctl", ["-n", "kern.ostype"], ["X=1"], true).unwrap_err(), Error(ENOENT))
+
+@test("a bare name for a child given a PATH is looked for on that PATH and nowhere else")
+bare_name_on_the_given_path()
+    val dir = realpath_sync(mkdtemp_sync("/tmp/libuv-env-XXXXXX").expect("a directory")).expect("resolved")
+    val script = dir + "/sysl-libuv-probe"
+
+    write_file_sync(script, "#!/bin/sh\necho found\n".bytes,
+                    S_IRUSR | S_IWUSR | S_IXUSR).expect("written")
+
+    assert_eq(captured("sysl-libuv-probe", [], ["PATH=" + dir], false).expect("it was found"),
+              "found\n")
+
+    // `env` is on this process's PATH and on the default path, and on neither of those is it looked
+    // for once the child has a PATH of its own.
+    assert_eq(captured("env", [], ["PATH=" + dir], false).unwrap_err(), Error(ENOENT))
+
+    unlink_sync(script).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a program that is not there is still ENOENT for a child that inherits nothing")
+missing_program_inheriting_nothing()
+    assert_eq(captured("no-such-program-anywhere", [], [], false).unwrap_err(), Error(ENOENT))
+
+// Run `file` to completion with its standard output captured, answering what it printed -- or what
+// `spawn` refused it with.
+private captured(file: string, args: []const string, env: []const string,
+                 inherit_env: bool) -> Result[string, Error]
+    val lp = default_loop()
+    val out = pipe(false, lp).expect("a pipe")
+    val got: &Text = Text("")
+
+    val r = spawn(file, args, no_exit_action, [Ignore, ToPipe(out, WRITABLE_PIPE), Inherit], "", env,
+                  0, lp, inherit_env)
+
+    if r.is_err()
+        out.close()
+        lp.run().expect("the loop ran")
+
+        return Err(r.unwrap_err())
+
+    val child = r.expect("started")
+
+    child.on_exit((status, signal) -> child.close())
+
+    out.read_start((read) -> read match
+        Data(bytes) -> got.add(bytes)
+        End -> out.close()
+        Failed(_) -> out.close()).expect("reading")
+
+    lp.run().expect("the loop ran")
+
+    Ok(got.text)
 
 // **`InheritFd` is the slot that takes a descriptor of THIS process's**, where `Inherit` takes the
 // one with the same number. Handing the child a file as its standard output is the shortest thing

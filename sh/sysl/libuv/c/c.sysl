@@ -528,6 +528,8 @@ extern "sysl_uv_stdio_set_fd" stdio_set_fd(stdio: *StdioContainer, i: i32, flags
 extern "sysl_uv_stdio_set_stream" stdio_set_stream(stdio: *StdioContainer, i: i32, flags: i32,
                                                    stream: *Stream)
 
+extern "sysl_uv_default_path" default_path(buf: *u8, size: usize) -> usize
+
 // ## The sizes
 //
 // **Asked for rather than written down**, and asked for in *words* rather than bytes. A handle is

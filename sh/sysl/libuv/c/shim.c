@@ -2,6 +2,7 @@
 
 #include <signal.h>
 #include <string.h>
+#include <unistd.h>
 
 void sysl_uv_buf_set(uv_buf_t *buf, char *base, size_t len) {
   buf->base = base;
@@ -75,4 +76,14 @@ int sysl_uv_thread_create_ex(uv_thread_t *tid, unsigned int flags, size_t stack_
   options.stack_size = stack_size;
 
   return uv_thread_create_ex(tid, &options, entry, arg);
+}
+
+size_t sysl_uv_default_path(char *buf, size_t size) {
+#ifdef _CS_PATH
+  return confstr(_CS_PATH, buf, size);
+#else
+  (void)buf;
+  (void)size;
+  return 0;
+#endif
 }
