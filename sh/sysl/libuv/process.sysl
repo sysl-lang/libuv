@@ -184,7 +184,7 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
 
     for a in args do p.strings.push(cstring(a))
 
-    var argv: []*u8 = [null; p.strings.len() + 1]
+    val argv: []*u8 = [null; p.strings.len() + 1]
 
     for i in 0..<p.strings.len() do argv[i] = p.strings.at(i).ptr
 
@@ -198,7 +198,7 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
 
         for e in env do p.strings.push(cstring(e))
 
-        var envp: []*u8 = [null; env.len + 1]
+        val envp: []*u8 = [null; env.len + 1]
 
         for i in 0..<env.len do envp[i] = p.strings.at(first + i).ptr
 
@@ -278,7 +278,7 @@ private on_default_path(file: string, env: []const string) -> Option[string]
 
     if size == 0 then return None
 
-    var bytes: []u8 = [0; size]
+    val bytes: []u8 = [0; size]
 
     c.default_path(as_mut_ptr(bytes), size)
 

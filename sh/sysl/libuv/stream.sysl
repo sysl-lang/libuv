@@ -69,7 +69,7 @@ private[libuv] ignore_status(r: Result[unit, Error]) -> unit = ()
 
 // Bytes of our own, since what a caller passed may be a local and a write outlives the call.
 private[libuv] copy_of(bytes: []const u8) -> []u8
-    var out: []u8 = [0; bytes.len]
+    val out: []u8 = [0; bytes.len]
 
     for i in 0..<bytes.len do out[i] = bytes[i]
 

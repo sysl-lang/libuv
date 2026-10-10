@@ -263,7 +263,7 @@ default_path_is_the_systems()
 
     if size == 0 then return
 
-    var bytes: []u8 = [0; size]
+    val bytes: []u8 = [0; size]
 
     c.default_path(as_mut_ptr(bytes), size)
 

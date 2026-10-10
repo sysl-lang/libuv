@@ -35,7 +35,7 @@ file_by_hand()
     assert(f.descriptor() >= 0, "an open file has a descriptor")
     assert_eq(f.write_sync([1, 2, 3, 4, 5]).expect("written"), 5)
 
-    var back: []u8 = [0; 5]
+    val back: []u8 = [0; 5]
 
     // Offset 0 rather than the position, which is at the end after that write.
     assert_eq(f.read_sync(back, 0).expect("read"), 5)
@@ -55,7 +55,7 @@ write_all()
     val path = dir + "/all"
     val f = open_sync(path, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR).expect("opened")
 
-    var big: []u8 = [7; 40000]
+    val big: []u8 = [7; 40000]
 
     f.write_all_sync(big).expect("written")
     f.close_sync().expect("closed")
@@ -82,7 +82,7 @@ truncating()
     assert_eq(info.size, 10)
     assert(info.is_file(), "it is still a file")
 
-    var back: []u8 = [9; 10]
+    val back: []u8 = [9; 10]
 
     assert_eq(f.read_sync(back, 0).expect("read"), 10)
     assert_eq(back[2], 3)

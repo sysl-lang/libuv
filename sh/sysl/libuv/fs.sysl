@@ -236,7 +236,7 @@ read_file_sync(path: string) -> Result[[]u8, Error]
         f.close_sync()
         return Err(info.unwrap_err())
 
-    var out: []u8 = [0; usize(info.unwrap().size)]
+    val out: []u8 = [0; usize(info.unwrap().size)]
     var at: usize = 0
 
     while at < out.len
@@ -506,7 +506,7 @@ private started(q: &FsReq, code: i32) -> Result[unit, Error]
 private fs_done(req: *c.Fs) -> unit
     val q: *FsReq = ptr_cast(c.req_get_data(ptr_cast(req)))
     val done = q.done
-    var bytes = q.data
+    val bytes = q.data
     val n = c.fs_get_result(req)
     val code = i32(n)
 
@@ -683,7 +683,7 @@ private ignore_count(r: Result[usize, Error]) -> unit = ()
 
 // Bytes of our own, since a write outlives the call that started it.
 private copy_of_bytes(bytes: []const u8) -> []u8
-    var out: []u8 = [0; bytes.len]
+    val out: []u8 = [0; bytes.len]
 
     for i in 0..<bytes.len do out[i] = bytes[i]
 
