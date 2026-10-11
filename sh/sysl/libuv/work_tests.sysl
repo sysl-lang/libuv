@@ -19,7 +19,7 @@ import sysl.sync.Atomic
 // what a job is allowed to capture, and the whole subject of `work.sysl`'s prose.
 private struct Shared
     ran: Atomic[int]
-    worker: Atomic[usize]
+    worker: Atomic[u64]
     gate: Atomic[int]
     started: Atomic[int]
 
@@ -29,7 +29,7 @@ private shared() -> &sync Shared = Shared(Atomic(0), Atomic(0), Atomic(0), Atomi
 // nothing.
 private struct Report
     n: int
-    on_thread: usize
+    on_thread: u64
     code: i32
 
     note(*self, r: Result[unit, Error])
