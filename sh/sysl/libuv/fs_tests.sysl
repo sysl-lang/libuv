@@ -405,6 +405,42 @@ async_rename_and_unlink()
 
     rmdir_sync(dir).expect("removed")
 
+@test("chmod on the pool sets exactly the mode bits it was given, as stat reports them")
+async_chmod()
+    val lp = default_loop()
+    val dir = scratch()
+    val path = dir + "/mode"
+    val got = nothing_landed()
+
+    write_file_sync(path, [1]).expect("written")
+
+    chmod(path, S_IRUSR | S_IWUSR | S_IRGRP, (r) ->
+        r.expect("changed")
+        got.done = true, lp).expect("the chmod started")
+
+    lp.run().expect("the loop ran")
+
+    assert(got.done, "the callback ran")
+    assert_eq(stat_sync(path).expect("stat").mode & 511, 416)
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("chmod on the pool of a path that is not there is ENOENT, in the callback")
+async_chmod_missing()
+    val lp = default_loop()
+    val got = nothing_landed()
+
+    chmod("/no/such/path/anywhere", 420, (r) ->
+        got.done = true
+
+        r match
+            Ok(_) -> got.code = 1
+            Err(e) -> got.code = e.code, lp).expect("the chmod started")
+
+    lp.run().expect("the loop ran")
+    assert_eq(got.code, ENOENT)
+
 @test("an asynchronous open of nothing fails in the callback rather than at the call")
 async_open_missing()
     val lp = default_loop()

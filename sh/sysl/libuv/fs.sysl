@@ -631,6 +631,14 @@ rename(path: string, to: string, cb: &Fn(Result[unit, Error]) -> unit = ignore_s
 
     started(q, c.fs_rename(lp.raw(), q.req(), a.ptr, b.ptr, &fs_done))
 
+/** Change a file's permission bits. */
+chmod(path: string, mode: i32, cb: &Fn(Result[unit, Error]) -> unit = ignore_status,
+      lp: &Loop = default_loop()) -> Result[unit, Error]
+    val q = new_fs_req(Nothing(cb))
+    val p = cstring(path)
+
+    started(q, c.fs_chmod(lp.raw(), q.req(), p.ptr, mode, &fs_done))
+
 /** The path with every link followed and every `..` resolved. */
 realpath(path: string, cb: &Fn(Result[string, Error]) -> unit,
          lp: &Loop = default_loop()) -> Result[unit, Error]

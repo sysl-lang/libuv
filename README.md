@@ -5,7 +5,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.9" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.12" }
 }
 ```
 
@@ -181,7 +181,7 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **threads** | `thread`, `thread_with_stack`, `join`, `id`, `current_thread`, `set_thread_name` |
 | **locks** | `mutex`, `recursive_mutex`, `cond`, `semaphore`, `rwlock`, `barrier` |
 | **files, blocking** | `open_sync`, `read_file_sync`, `write_file_sync`, `stat_sync`, `scandir_sync`, `symlink_sync`, … |
-| **files, not** | `open`, `read`, `write`, `stat`, `scandir`, `read_file`, … |
+| **files, not** | `open`, `read`, `write`, `stat`, `scandir`, `chmod`, `read_file`, … |
 | **children** | `spawn`, `Stdio`, `kill`, `on_exit` |
 | **the machine** | `hrtime`, `hostname`, `cwd`, `env`, `available_parallelism`, memory, load |
 
