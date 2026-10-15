@@ -72,6 +72,7 @@ c const
     ENOTEMPTY: i32 = "UV_ENOTEMPTY"
     ENOSYS: i32 = "UV_ENOSYS"
     EPIPE: i32 = "UV_EPIPE"
+    ESRCH: i32 = "UV_ESRCH"
     ETIMEDOUT: i32 = "UV_ETIMEDOUT"
     ENOTSUP: i32 = "UV_ENOTSUP"
 

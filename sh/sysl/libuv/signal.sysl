@@ -119,6 +119,7 @@ ignore_sigpipe() = c.ignore_sigpipe()
 /** Send a signal to a process by pid, which is `kill(2)` and needs no loop and no handle.
  *
  * `signum` of `0` sends nothing and reports whether the process exists and could be signalled,
- * which is the ordinary way to ask.
+ * which is the ordinary way to ask. `ESRCH` is the answer for a process that is not there -- one
+ * that has exited and been reaped among them.
  */
 kill(pid: i32, signum: i32) -> Result[unit, Error] = checked(c.kill(pid, signum))
