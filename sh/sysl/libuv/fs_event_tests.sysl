@@ -1,0 +1,250 @@
+module sh.sysl.libuv
+@tests
+
+// Watching the file system, against the real one.
+//
+// **Each test watches a directory made by `mkdtemp_sync`**, changes something in it from a timer
+// once the watcher has had time to settle, and closes the watcher from a second timer after the
+// platform has had time to report. What it then asserts is what was collected in between -- so a
+// test that sees nothing still ends, and fails on its assertions rather than hanging the suite.
+//
+// **The recursive case asserts macOS's behaviour.** FSEvents reports a subdirectory's entries as
+// `sub/name`; on Linux inotify does not see into a subdirectory at all, and no Linux machine runs
+// this suite, so that half is documented rather than tested.
+
+import sysl.buf.{Buf, buf}
+
+// Long enough for FSEvents to have started its stream before anything changes, and then long
+// enough for its latency to pass before the watcher is closed.
+private val SETTLE: u64 = 300
+private val QUIET: u64 = 700
+
+private fs_event_scratch() -> string =
+    mkdtemp_sync("/tmp/libuv-fsevent-XXXXXX").expect("a temporary directory")
+
+// Everything a watcher was told, in order.
+private struct Seen
+    names: Buf[string]
+    events: Buf[i32]
+    failures: int
+    closed: int
+
+    note(*self, r: Result[FsChange, Error]) = r match
+        Ok(change) ->
+            self.names.push(change.filename.unwrap_or("<none>"))
+            self.events.push(change.events)
+        Err(e) -> self.failures += 1
+
+    // The bits reported for `name`, over every event that named it.
+    bits_for(*self, name: string) -> i32
+        var bits = 0
+
+        for i in 0..<self.names.len()
+            if self.names[i] == name then bits = bits | self.events[i]
+        bits
+
+    count(*self) -> usize = self.names.len()
+
+    // What was reported, as `name:bits` pairs, for a failing assertion to say.
+    report(*self) -> string
+        var out = ""
+
+        for i in 0..<self.names.len()
+            out = out + s" ${self.names[i]}:${self.events[i]}"
+        out
+
+private seen() -> &Seen = Seen(buf(), buf(), 0, 0)
+
+// Run `cb` once, `ms` from now, and close the timer that ran it.
+private after(lp: &Loop, ms: u64, cb: &Fn() -> unit)
+    val t = timer(lp).expect("a timer")
+
+    t.start(ms, 0, () ->
+        cb()
+        t.close()).expect("started")
+
+// -- What each change is reported as -----------------------------------------------------------
+
+@test("creating a file in a watched directory is a rename naming the new file")
+fs_event_create()
+    val lp = default_loop()
+    val dir = fs_event_scratch()
+    val s = seen()
+    val w = watch(dir, false, (r) -> s.note(r)).expect("watching")
+
+    after(lp, SETTLE, () -> write_file_sync(dir + "/fresh", [1, 2, 3]).expect("written"))
+    after(lp, SETTLE + QUIET, () -> w.close())
+    lp.run().expect("the loop ran")
+
+    assert((s.bits_for("fresh") & FS_RENAME) != 0,
+           s"a new name is reported as a rename; reported:${s.report()}")
+    assert_eq(s.failures, 0)
+
+    unlink_sync(dir + "/fresh").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+// The file itself is watched rather than its directory. **FSEvents carries a file's history in the
+// flags of a later event**, so a file made a moment ago is still reported as a rename when it is
+// written to through a directory watcher; a watcher on the file is kqueue on macOS, and says
+// exactly what happened.
+@test("modifying a watched file is a change naming it, and not a rename")
+fs_event_modify()
+    val lp = default_loop()
+    val dir = fs_event_scratch()
+    val s = seen()
+
+    write_file_sync(dir + "/kept", [1]).expect("written")
+
+    val w = watch(dir + "/kept", false, (r) -> s.note(r)).expect("watching")
+
+    after(lp, SETTLE, () -> write_file_sync(dir + "/kept", [9, 9]).expect("rewritten"))
+    after(lp, SETTLE + QUIET, () -> w.close())
+    lp.run().expect("the loop ran")
+
+    val bits = s.bits_for("kept")
+
+    assert((bits & FS_CHANGE) != 0, s"new contents are a change; reported:${s.report()}")
+    assert((bits & FS_RENAME) == 0, s"and the name did not move; reported:${s.report()}")
+    assert_eq(s.failures, 0)
+
+    unlink_sync(dir + "/kept").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("renaming a file is a rename of the old name and of the new one")
+fs_event_rename()
+    val lp = default_loop()
+    val dir = fs_event_scratch()
+    val s = seen()
+
+    write_file_sync(dir + "/before", [1]).expect("written")
+    sleep(u32(SETTLE))
+    lp.update_time()
+
+    val w = watch(dir, false, (r) -> s.note(r)).expect("watching")
+
+    after(lp, SETTLE, () -> rename_sync(dir + "/before", dir + "/after").expect("renamed"))
+    after(lp, SETTLE + QUIET, () -> w.close())
+    lp.run().expect("the loop ran")
+
+    assert((s.bits_for("before") & FS_RENAME) != 0, s"the old name went; reported:${s.report()}")
+    assert((s.bits_for("after") & FS_RENAME) != 0, s"and the new one came; reported:${s.report()}")
+    assert_eq(s.failures, 0)
+
+    unlink_sync(dir + "/after").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("renamed and changed each read their own bit of the events")
+fs_event_bits()
+    val both = FsChange(Some("f"), FS_RENAME | FS_CHANGE)
+    val moved = FsChange(None, FS_RENAME)
+    val edited = FsChange(None, FS_CHANGE)
+
+    assert(both.renamed() && both.changed(), "both bits, both answers")
+    assert(moved.renamed() && !moved.changed(), "a rename is not a change")
+    assert(edited.changed() && !edited.renamed(), "a change is not a rename")
+    assert(FS_RENAME != FS_CHANGE, "libuv's two bits are distinct")
+
+// -- Recursive, and not ------------------------------------------------------------------------
+
+@test("a recursive watcher sees into a subdirectory, and a plain one does not")
+fs_event_recursive()
+    val lp = default_loop()
+    val dir = fs_event_scratch()
+    val deep = seen()
+    val flat = seen()
+
+    mkdir_sync(dir + "/sub").expect("made")
+
+    val r = watch(dir, true, (e) -> deep.note(e)).expect("watching recursively")
+    val p = watch(dir, false, (e) -> flat.note(e)).expect("watching one level")
+
+    after(lp, SETTLE, () -> write_file_sync(dir + "/sub/inner", [1]).expect("written"))
+    after(lp, SETTLE + QUIET, () ->
+        r.close()
+        p.close())
+    lp.run().expect("the loop ran")
+
+    assert(deep.bits_for("sub/inner") != 0, "the recursive watcher names the file under sub/")
+    assert_eq(flat.bits_for("sub/inner"), 0)
+    assert_eq(deep.failures, 0)
+
+    unlink_sync(dir + "/sub/inner").expect("removed")
+    rmdir_sync(dir + "/sub").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+// -- Stopping, closing, and what a watcher is watching ----------------------------------------------
+
+@test("a stopped watcher is told nothing more, and is not active")
+fs_event_stop()
+    val lp = default_loop()
+    val dir = fs_event_scratch()
+    val s = seen()
+    val w = watch(dir, false, (r) -> s.note(r)).expect("watching")
+
+    assert(w.is_active(), "a started watcher is active")
+    w.stop().expect("stopped")
+    assert(!w.is_active(), "and a stopped one is not")
+
+    // Nothing else is open, so this is the loop proving the watcher is no longer something to wait
+    // for -- and the write below happens with nobody listening.
+    assert(!lp.run().unwrap(), "a stopped watcher keeps nothing alive")
+
+    write_file_sync(dir + "/unseen", [1]).expect("written")
+    after(lp, SETTLE + QUIET, () -> ())
+    lp.run().expect("the loop ran")
+
+    assert_eq(s.count(), 0)
+
+    w.close()
+    lp.run().expect("the loop ran")
+    unlink_sync(dir + "/unseen").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("closing a watcher runs its close callback once, and nothing is reported after")
+fs_event_close()
+    val lp = default_loop()
+    val dir = fs_event_scratch()
+    val s = seen()
+    val w = watch(dir, false, (r) -> s.note(r)).expect("watching")
+
+    w.close(() -> s.closed += 1)
+    assert(w.is_closing(), "a watcher being closed says so")
+    lp.run().expect("the loop ran")
+    assert_eq(s.closed, 1)
+
+    write_file_sync(dir + "/late", [1]).expect("written")
+    after(lp, SETTLE + QUIET, () -> ())
+    lp.run().expect("the loop ran")
+
+    assert_eq(s.count(), 0)
+
+    unlink_sync(dir + "/late").expect("removed")
+    rmdir_sync(dir).expect("removed")
+
+@test("a watcher says which path it watches, and EINVAL when it watches none")
+fs_event_path()
+    val lp = default_loop()
+    val dir = fs_event_scratch()
+    val w = fs_event(lp).expect("a watcher")
+
+    assert_eq(w.path().unwrap_err().code, EINVAL)
+
+    w.start(dir, (r) -> ()).expect("watching")
+    assert_eq(w.path().expect("a path"), dir)
+
+    w.close()
+    lp.run().expect("the loop ran")
+    rmdir_sync(dir).expect("removed")
+
+// -- The error path ------------------------------------------------------------------------------
+
+@test("watching a path that is not there is ENOENT, at the call")
+fs_event_missing()
+    val lp = default_loop()
+    val got = watch("/tmp/libuv-fsevent-no-such-dir/at-all", true, (r) -> ())
+
+    assert_eq(got.unwrap_err().code, ENOENT)
+
+    // `watch` closed the watcher it made for the refused path; the loop finishing that close and
+    // returning is the proof nothing was left open.
+    assert(!lp.run().unwrap(), "nothing is left open")

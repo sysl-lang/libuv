@@ -141,6 +141,27 @@ c const
     SIGUSR2: i32 = "SIGUSR2"
     SIGWINCH: i32 = "SIGWINCH"
 
+// ## File system events
+//
+// What an `FsEvent` callback reports, as bits of `FsChange.events`: `FS_RENAME` for a name appearing,
+// disappearing or moving, and `FS_CHANGE` for a file's contents or attributes. **Both may be set
+// together**, and which one a creation is reported as is the platform's choice -- macOS's FSEvents
+// and Linux's inotify both call a new file a rename.
+c const
+    FS_RENAME: i32 = "UV_RENAME"
+    FS_CHANGE: i32 = "UV_CHANGE"
+
+// What `FsEvent.start` takes. `FS_EVENT_RECURSIVE` watches a directory's subdirectories too -- on
+// macOS and Windows. **On Linux it is not honoured**: inotify watches one directory at a time and
+// libuv does not walk the tree, so a subdirectory there needs a watcher of its own.
+// `FS_EVENT_WATCH_ENTRY` and `FS_EVENT_STAT` are accepted and libuv documents both as not
+// implemented yet; they are named so that a program written against the header can say what it
+// means.
+c const
+    FS_EVENT_WATCH_ENTRY: u32 = "UV_FS_EVENT_WATCH_ENTRY"
+    FS_EVENT_STAT: u32 = "UV_FS_EVENT_STAT"
+    FS_EVENT_RECURSIVE: u32 = "UV_FS_EVENT_RECURSIVE"
+
 // ## Addresses
 
 c const
@@ -220,6 +241,7 @@ c const
     HANDLE_CHECK: i32 = "UV_CHECK"
     HANDLE_ASYNC: i32 = "UV_ASYNC"
     HANDLE_SIGNAL: i32 = "UV_SIGNAL"
+    HANDLE_FS_EVENT: i32 = "UV_FS_EVENT"
     HANDLE_PROCESS: i32 = "UV_PROCESS"
 
 // And what a request turns out to be, which is what `req_size` is asked about.

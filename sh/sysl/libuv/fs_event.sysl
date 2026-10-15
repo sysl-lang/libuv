@@ -1,0 +1,137 @@
+// Watching the file system: told when a file or a directory changes, by the operating system.
+//
+//     val w = watch("site", true, (r) -> r match
+//         Ok(change) -> rebuild(change.filename)
+//         Err(e) -> print(s"watching stopped: $e"))?
+//
+//     ...
+//     w.close()
+//
+// **This is the operating system's notification, not a poll**: FSEvents on macOS, inotify on Linux,
+// `ReadDirectoryChangesW` on Windows. Nothing is read from the disk to find out, so it costs nothing
+// while nothing happens -- and what is reported, and how it is batched, is the platform's.
+//
+// **Watching a directory reports the names inside it**, relative to the directory; watching a file
+// reports the file. A creation is usually a rename, an edit is a change, and one write may arrive as
+// several events or several writes as one. A program that rebuilds on a change wants to debounce,
+// and wants to look at the file system again rather than trust the event to say what is there.
+//
+// **Recursive watching is macOS's and Windows's.** On Linux inotify watches one directory at a
+// time and libuv does not walk the tree, so `FS_EVENT_RECURSIVE` is not honoured there and each
+// subdirectory needs a watcher of its own.
+//
+// **The handle outlives its last name**, as every handle in this package does: dropping it does not
+// stop it, and `close` does -- `stop` too, if the handle is to be started again.
+
+module sh.sysl.libuv
+
+import sh.sysl.libuv.c
+import sysl.text.cstring
+import sysl.text.from_cstring
+
+/** One notification: what changed, and how.
+ *
+ * `filename` is `None` where the platform did not say which entry it was, which libuv allows -- and
+ * where the name it gave was not UTF-8.
+ */
+struct FsChange
+    filename: Option[string]
+    events: i32
+
+    /** A name appeared, disappeared or moved: `FS_RENAME` is set. */
+    renamed(self) -> bool = (self.events & FS_RENAME) != 0
+
+    /** A file's contents or attributes changed: `FS_CHANGE` is set. */
+    changed(self) -> bool = (self.events & FS_CHANGE) != 0
+
+/** A file system watcher. One path at a time: start it again after `stop` to watch another. */
+struct FsEvent
+    private storage: [c.FS_EVENT_WORDS]u64
+    private lp: &Loop
+    private me: Option[&FsEvent]
+    private on_event: &Fn(Result[FsChange, Error]) -> unit
+    private on_closed: &Fn() -> unit
+
+    private raw(*self) -> *c.FsEvent = ptr_cast(&self.storage[0])
+
+    /** The loop this watcher is on. */
+    on_loop(*self) -> &Loop = self.lp
+
+    /** Call `cb` for every change to `path`, until stopped.
+     *
+     * `flags` is `FS_EVENT_RECURSIVE`, `FS_EVENT_WATCH_ENTRY` and `FS_EVENT_STAT` or'd together, or
+     * `0`. A path that is not there is refused here, as `ENOENT`, rather than in the callback. A
+     * failure the backend reports later arrives in the callback as an `Err`.
+     */
+    start(*self, path: string, cb: &Fn(Result[FsChange, Error]) -> unit,
+          flags: u32 = 0) -> Result[unit, Error]
+        val p = cstring(path)
+
+        self.on_event = cb
+        checked(c.fs_event_start(self.raw(), &fs_event_raised, p.ptr, flags))
+
+    /** Stop watching. The callback is kept, and nothing more is delivered to it. */
+    stop(*self) -> Result[unit, Error] = checked(c.fs_event_stop(self.raw()))
+
+    /** The path being watched, as it was given to `start`. `EINVAL` if nothing is. */
+    path(*self) -> Result[string, Error]
+        var buf: [4096]u8 = [0; 4096]
+        var size: usize = 4096
+
+        checked(c.fs_event_getpath(self.raw(), &buf[0], &size))?
+        Ok(from_cstring(&buf[0]).unwrap_or(""))
+
+end FsEvent
+
+impl Handle for FsEvent
+    handle_ptr(*self) -> *c.Handle = ptr_cast(&self.storage[0])
+
+    set_close_callback(*self, cb: &Fn() -> unit) = self.on_closed = cb
+
+    finish_close(*self)
+        val cb = self.on_closed
+
+        self.on_event = noop_fs_event
+        self.on_closed = noop
+        self.me = None
+
+        cb()
+
+
+private noop_fs_event(r: Result[FsChange, Error]) -> unit = ()
+
+private fs_event_raised(h: *c.FsEvent, filename: *u8, events: i32, status: i32) -> unit
+    val w: *FsEvent = ptr_cast(c.handle_get_data(ptr_cast(h)))
+
+    if status < 0
+        w.on_event(Err(Error(status)))
+    else
+        val name = if filename == null then None else from_cstring(filename).ok()
+
+        w.on_event(Ok(FsChange(name, events)))
+
+/** A file system watcher on `lp`, watching nothing yet. */
+fs_event(lp: &Loop = default_loop()) -> Result[&FsEvent, Error]
+    var w: &FsEvent = FsEvent([0; c.FS_EVENT_WORDS], lp, None, noop_fs_event, noop)
+
+    checked(c.fs_event_init(lp.raw(), w.raw()))?
+
+    w.me = Some(w)
+    c.handle_set_data(w.handle_ptr(), ptr_cast(&*w))
+    Ok(w)
+
+/** Watch `path` on `lp`, and its subdirectories too where `recursive` is set and the platform can.
+ *
+ * The one call a program usually wants: a watcher made and started. A path that cannot be watched
+ * is an `Err` here, and the watcher made for it is closed before this returns.
+ */
+watch(path: string, recursive: bool, cb: &Fn(Result[FsChange, Error]) -> unit,
+      lp: &Loop = default_loop()) -> Result[&FsEvent, Error]
+    val w = fs_event(lp)?
+    val started = w.start(path, cb, if recursive then FS_EVENT_RECURSIVE else 0)
+
+    if started.is_err()
+        w.close()
+        return Err(started.unwrap_err())
+
+    Ok(w)

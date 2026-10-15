@@ -501,6 +501,7 @@ private churn(lp: &Loop)
         check(lp).expect("a check watcher").close()
         notifier(noop, lp).expect("a notifier").close()
         signal(lp).expect("a signal watcher").close()
+        fs_event(lp).expect("a file system watcher").close()
 
     for i in 0..<sockets
         tcp(lp).expect("a socket").close()

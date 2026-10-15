@@ -7,7 +7,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.12" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.13" }
 }
 ```
 
@@ -174,6 +174,7 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **watchers** | `idle`, `prepare`, `check` |
 | **wake-ups** | `notifier` — the one handle another thread may touch; `waker`, which is the `send` on its own as a value |
 | **signals** | `signal`, `start`, `start_once`, `kill`, `ignore_sigpipe` |
+| **file system events** | `watch`, `fs_event`, `start` (with `FS_EVENT_RECURSIVE`), `stop`, `path`; `FsChange` with `filename`, `renamed`, `changed` |
 | **streams** | `read_start`, `write`, `try_write`, `shutdown`, `listen`, back-pressure |
 | **TCP** | `tcp`, `bind` (with `TCP_IPV6ONLY` and `TCP_REUSEPORT`), `listen`, `accept`, `connect`, `nodelay`, `keepalive`, `sockname` |
 | **pipes** | `pipe`, `pipe_pair`, `socket_pair`, Unix domain sockets, and `write_handle` / `pending_count` / `pending_type` / `accept_pending` for passing a handle |
@@ -188,7 +189,7 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **the machine** | `hrtime`, `hostname`, `cwd`, `env`, `available_parallelism`, memory, load |
 
 **What is not bound yet**, and is ordinary work rather than anything blocked: UDP, `uv_poll_t`,
-`uv_fs_event_t` and `uv_fs_poll_t`, `getnameinfo`, `uv_random`, and `dlopen`. Each is a section of
+`uv_fs_poll_t`, `getnameinfo`, `uv_random`, and `dlopen`. Each is a section of
 `uv.h` and each would be added the way the ones above were.
 
 **Three of libuv's threading calls are left out on purpose.** `uv_thread_detach` would free the box a
@@ -432,6 +433,41 @@ read_file("big.dat", (r) -> r match                     // on the pool, answered
 asynchronous and `_sync` is the one that blocks. A server should reach for the plain one on any path
 a request waits on, and nobody should reach for it to read a file at startup.
 
+## Watching the file system
+
+`watch` is told when something under a path changes, by the operating system rather than by a poll:
+FSEvents for a directory on macOS, kqueue for a file there, inotify on Linux.
+
+```sysl
+val w = watch("site", true, (r) -> r match              // true: subdirectories too
+    Ok(change) -> rebuild(change.filename)              // Option[string], relative to "site"
+    Err(e) -> print(s"watching stopped: $e"))?
+
+w.close()                                               // what stops it, as for every handle
+```
+
+Each `FsChange` carries libuv's bits: `renamed()` is `FS_RENAME` — a name appeared, went or moved —
+and `changed()` is `FS_CHANGE`, new contents or attributes. **`filename` is an `Option`** because
+libuv may report a change without saying what it was. A path that is not there is refused at the
+call, as `ENOENT`; a failure the backend reports later arrives as an `Err` in the callback.
+`fs_event(lp)` makes a watcher without starting it, and `start(path, cb, flags)` takes the flags
+directly; `path()` answers what it is watching.
+
+**What is reported, and how it is batched, is the platform's.** A creation is a rename, one write may
+arrive as several events and several as one, and FSEvents carries a file's recent history in the
+flags of a later event — so a file made a moment ago and then written through a *directory* watcher
+is still reported as a rename. A program that rebuilds on a change wants to debounce, and to look at
+the file system again rather than trust the event to say what is there.
+
+**Recursive watching is macOS's and Windows's.** On Linux inotify watches one directory at a time and
+libuv does not walk the tree, so `FS_EVENT_RECURSIVE` is not honoured there and each subdirectory
+needs a watcher of its own. The suite's recursive case asserts macOS's behaviour and has not been
+run on Linux. `FS_EVENT_WATCH_ENTRY` and `FS_EVENT_STAT` are named, and libuv documents both as not
+implemented yet.
+
+**Dropping the last name for a watcher does not stop it**, as for every handle here (see above): the
+loop holds it until `close`.
+
 ## Child processes
 
 ```sysl
@@ -513,14 +549,14 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and fifty-six of them, over eight files, and every public entry point but one is exercised
+**A hundred and sixty-seven of them, over nine files, and every public entry point but one is exercised
 by one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
 macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
 binding, and a test runner has no controlling terminal to use instead. It says so at the site.
 
 **The whole raw layer is exercised too**, which is a separate file: a declaration nothing calls is a
 declaration nothing checks, and a signature that disagrees with `uv.h` links perfectly and corrupts
-the call at run time. Every one of the 224 `extern`s is now reached, from the pleasant layer or from
+the call at run time. Every one of the 228 `extern`s is now reached, from the pleasant layer or from
 `raw_tests.sysl` directly. `uv_cancel` was the one exception until the thread pool arrived — it may
 only be called on a request still in flight, and on a finished one it faults, so there was nothing
 safe to call it from. `Work.cancel` is that caller now, because a request knows whether it is still
@@ -567,7 +603,10 @@ and a struct this side declares has the layout the header does.
 The end-to-end ones are real: a TCP echo over the loopback on a port the kernel picked, a Unix domain
 socket in a temporary directory, `localhost` resolved on the thread pool, a file written and read
 back, `echo hello` spawned with its output read through a pipe, and `/bin/pwd` run in a directory it
-was given with an environment it was given.
+was given with an environment it was given. The file system watcher is tested against the real one
+in a temporary directory: a creation, a modification and a rename each with its bits and its name, a
+recursive watch seeing into a subdirectory where a plain one does not, `stop` and `close` silencing
+it, and a missing path refused as `ENOENT`.
 
 **Seven things here were wrong until a test said so**, which is the argument for writing them:
 `again` refuses only a timer that was never started rather than one with no interval; `due_in` still

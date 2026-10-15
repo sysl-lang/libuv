@@ -51,6 +51,7 @@ opaque struct Prepare
 opaque struct Check
 opaque struct Async
 opaque struct Signal
+opaque struct FsEvent
 opaque struct Process
 
 opaque struct Req
@@ -330,6 +331,17 @@ extern "uv_signal_start_oneshot" signal_start_oneshot(h: *Signal,
 extern "uv_signal_stop" signal_stop(h: *Signal) -> i32
 extern "uv_kill" kill(pid: i32, signum: i32) -> i32
 
+// ## File system events
+//
+// The callback is handed the name of what changed, which libuv may leave null where the platform
+// did not say, a bit set of `UV_RENAME` and `UV_CHANGE`, and a status that is negative on failure.
+
+extern "uv_fs_event_init" fs_event_init(l: *Loop, h: *FsEvent) -> i32
+extern "uv_fs_event_start" fs_event_start(h: *FsEvent, cb: *extern(*FsEvent, *u8, i32, i32) -> unit,
+                                          path: *u8, flags: u32) -> i32
+extern "uv_fs_event_stop" fs_event_stop(h: *FsEvent) -> i32
+extern "uv_fs_event_getpath" fs_event_getpath(h: *FsEvent, buffer: *u8, size: *usize) -> i32
+
 // ## Stream
 //
 // What TCP, a pipe and a TTY have in common. A `*Tcp` is a `*Stream` is a `*Handle` in C, by the
@@ -552,6 +564,7 @@ c const
     CHECK_WORDS: usize = "(sizeof(uv_check_t) + 7) / 8"
     ASYNC_WORDS: usize = "(sizeof(uv_async_t) + 7) / 8"
     SIGNAL_WORDS: usize = "(sizeof(uv_signal_t) + 7) / 8"
+    FS_EVENT_WORDS: usize = "(sizeof(uv_fs_event_t) + 7) / 8"
     PROCESS_WORDS: usize = "(sizeof(uv_process_t) + 7) / 8"
 
     WRITE_WORDS: usize = "(sizeof(uv_write_t) + 7) / 8"

@@ -48,6 +48,7 @@ type_names()
     assert_eq(from_cstring(c.handle_type_name(HANDLE_TIMER)).unwrap_or("?"), "timer")
     assert_eq(from_cstring(c.handle_type_name(HANDLE_TCP)).unwrap_or("?"), "tcp")
     assert_eq(from_cstring(c.handle_type_name(HANDLE_SIGNAL)).unwrap_or("?"), "signal")
+    assert_eq(from_cstring(c.handle_type_name(HANDLE_FS_EVENT)).unwrap_or("?"), "fs_event")
 
     assert_eq(from_cstring(c.req_type_name(REQ_WRITE)).unwrap_or("?"), "write")
     assert_eq(from_cstring(c.req_type_name(REQ_FS)).unwrap_or("?"), "fs")
