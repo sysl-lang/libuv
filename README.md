@@ -3,6 +3,8 @@
 libuv for sysl — the event loop Node.js is built on, with TCP, pipes, terminals, timers, signals,
 child processes, name resolution and a file system that does not block.
 
+*An independent sysl package for libuv. It is not affiliated with or endorsed by libuv's authors or trademark holders.*
+
 ```
 dependencies {
   libuv { git = "github.com/sysl-lang/libuv", version = "0.1.12" }
