@@ -542,6 +542,8 @@ extern "sysl_uv_stdio_set_stream" stdio_set_stream(stdio: *StdioContainer, i: i3
 
 extern "sysl_uv_default_path" default_path(buf: *u8, size: usize) -> usize
 
+extern "sysl_uv_heap_in_use" heap_in_use() -> usize
+
 // ## The sizes
 //
 // **Asked for rather than written down**, and asked for in *words* rather than bytes. A handle is

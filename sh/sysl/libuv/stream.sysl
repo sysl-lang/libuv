@@ -10,13 +10,16 @@
 //
 // ## Reading
 //
-// **The bytes handed to the callback are the stream's own buffer**, and they are valid for the call
-// and no longer. A callback that wants to keep them copies them; one that parses them and keeps
-// what it found -- which is what most do -- copies nothing.
+// **The bytes handed to the callback are valid for the call and no longer.** They are a view of one
+// read buffer every stream on the thread shares, and the next read on any stream writes over them.
+// A callback that wants to keep them copies them; one that parses them and keeps what it found --
+// which is what most do -- copies nothing.
 //
-// The buffer is allocated once by `read_start` and reused for every read after it. `buffer_size`
-// decides how much can arrive at a time, and 64 KiB is what libuv itself suggests. A server with
-// thousands of idle connections wants a smaller one, since it is per stream.
+// **A stream holds no buffer while it waits**, which is what node does too. libuv asks for storage
+// only when bytes are ready, and reads one stream at a time, so one buffer per thread serves every
+// stream on it: a server with ten thousand idle connections holds one buffer, not ten thousand.
+// `buffer_size` is the most one read delivers, 64 KiB by default because that is what libuv itself
+// suggests, and the shared buffer grows to the largest size any stream on the thread has asked for.
 //
 // ## Writing
 //
@@ -49,8 +52,8 @@ enum Read
     End
     Failed(e: Error)
 
-/** The callbacks and the buffer every stream carries. It is a field of the concrete handle rather
- * than a thing of its own, so it lives and dies with it.
+/** The callbacks every stream carries, and the most one of its reads may deliver. It is a field of
+ * the concrete handle rather than a thing of its own, so it lives and dies with it.
  *
  * **This is plumbing rather than a program's business.** It is public only because `Stream` names
  * it, and a trait cannot hide a member from the type that implements it.
@@ -58,10 +61,15 @@ enum Read
 struct StreamState
     on_read: &Fn(Read) -> unit
     on_connection: &Fn() -> unit
-    buffer: []u8
+    read_size: usize
 
 // A stream that has never read and never listened.
-private[libuv] fresh_stream_state() -> StreamState = StreamState(ignore_read, noop, [0; 0])
+private[libuv] fresh_stream_state() -> StreamState = StreamState(ignore_read, noop, 0)
+
+// The one read buffer of this thread, handed to whichever stream libuv is about to read. A loop runs
+// on one thread and libuv reads one stream at a time -- the allocation callback and then the read
+// callback, nothing between them -- so no two reads ever hold it at once. It only grows.
+@thread_local private var read_slab: []u8
 
 private[libuv] ignore_read(r: Read) -> unit = ()
 
@@ -104,21 +112,22 @@ trait Stream: Handle
 
     /** Start reading, calling `cb` with everything that arrives until `read_stop` or a failure.
      *
-     * `buffer_size` is how much can arrive in one call, allocated once and reused. Calling
-     * `read_start` again replaces the callback, and reallocates only if the size changed.
+     * `buffer_size` is the most one call can deliver. Nothing is allocated for it here: the bytes
+     * are read into one buffer the whole thread shares, so a reader that is waiting costs nothing
+     * but its handle. Calling `read_start` again replaces the callback and the size.
      *
-     * **The slice a `Data` carries is the buffer**, so it is valid for the call and not after it.
+     * **The slice a `Data` carries is valid for the call and not after it** -- the next read, on
+     * this stream or any other, writes over it. A callback that keeps the bytes copies them.
      */
     read_start(*self, cb: &Fn(Read) -> unit, buffer_size: usize = 65536) -> Result[unit, Error]
         val st = self.stream_state()
 
         st.on_read = cb
-
-        if st.buffer.len != buffer_size then st.buffer = [0; buffer_size]
+        st.read_size = buffer_size
 
         checked(c.read_start(self.stream_ptr(), &stream_alloc[Self], &stream_read[Self]))
 
-    /** Stop reading. The callback and the buffer are kept, so `read_start` can resume cheaply. */
+    /** Stop reading. The callback is kept, so `read_start` can resume with nothing but the call. */
     read_stop(*self) -> Result[unit, Error] = checked(c.read_stop(self.stream_ptr()))
 
     /** Start accepting connections, calling `cb` once per connection waiting to be accepted.
@@ -203,18 +212,21 @@ end Stream
 
 private stream_alloc[S: Stream](h: *c.Handle, suggested: usize, buf: *c.Buf) -> unit
     val s: *S = ptr_cast(c.handle_get_data(h))
-    val st = s.stream_state()
+    val size = s.stream_state().read_size
 
-    c.buf_set(buf, as_mut_ptr(st.buffer), st.buffer.len)
+    if read_slab.len < size then read_slab = [0; size]
+
+    c.buf_set(buf, as_mut_ptr(read_slab), size)
 
 private stream_read[S: Stream](h: *c.Stream, nread: isize, buf: *c.Buf) -> unit
     val s: *S = ptr_cast(c.handle_get_data(ptr_cast(h)))
     val st = s.stream_state()
 
     // Zero is libuv saying "nothing this time, try again", which is not an event a program has any
-    // use for -- the callback is not called for it.
+    // use for -- the callback is not called for it. The bytes are where `stream_alloc` put them,
+    // since nothing runs between the two.
     if nread > 0
-        st.on_read(Data(st.buffer[0..<usize(nread)]))
+        st.on_read(Data(read_slab[0..<usize(nread)]))
     else if nread < 0
         val code = i32(nread)
 

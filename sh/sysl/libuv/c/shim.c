@@ -4,6 +4,12 @@
 #include <string.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 void sysl_uv_buf_set(uv_buf_t *buf, char *base, size_t len) {
   buf->base = base;
   buf->len = len;
@@ -84,6 +90,16 @@ size_t sysl_uv_default_path(char *buf, size_t size) {
 #else
   (void)buf;
   (void)size;
+  return 0;
+#endif
+}
+
+size_t sysl_uv_heap_in_use(void) {
+#if defined(__APPLE__)
+  return mstats().bytes_used;
+#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+  return mallinfo2().uordblks;
+#else
   return 0;
 #endif
 }

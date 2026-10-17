@@ -7,7 +7,7 @@ child processes, name resolution and a file system that does not block.
 
 ```
 dependencies {
-  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.14" }
+  libuv { git = "github.com/sysl-lang/libuv", version = "0.1.15" }
 }
 ```
 
@@ -175,7 +175,7 @@ failure writes. The codes worth acting on are named in `constants.sysl`.
 | **wake-ups** | `notifier` — the one handle another thread may touch; `waker`, which is the `send` on its own as a value |
 | **signals** | `signal`, `start`, `start_once`, `kill`, `ignore_sigpipe` |
 | **file system events** | `watch`, `fs_event`, `start` (with `FS_EVENT_RECURSIVE`), `stop`, `path`; `FsChange` with `filename`, `renamed`, `changed` |
-| **streams** | `read_start`, `write`, `try_write`, `shutdown`, `listen`, back-pressure |
+| **streams** | `read_start` (one read buffer per thread, so a waiting reader holds none), `write`, `try_write`, `shutdown`, `listen`, back-pressure |
 | **TCP** | `tcp`, `bind` (with `TCP_IPV6ONLY` and `TCP_REUSEPORT`), `listen`, `accept`, `connect`, `nodelay`, `keepalive`, `sockname` |
 | **pipes** | `pipe`, `pipe_pair`, `socket_pair`, Unix domain sockets, and `write_handle` / `pending_count` / `pending_type` / `accept_pending` for passing a handle |
 | **terminals** | `tty`, `set_mode`, `winsize`, `reset_tty_mode`, `guess_handle` |
@@ -549,14 +549,14 @@ says so rather than letting it fail at the link with a message naming `uv_run`.
 sysl test .
 ```
 
-**A hundred and sixty-seven of them, over nine files, and every public entry point but one is exercised
+**A hundred and seventy-three of them, over nine files, and every public entry point but one is exercised
 by one.** The one is `Tty.winsize`, which needs a terminal with a slave attached — on a pty *master*
 macOS refuses it and Linux allows it, so a test either way would pin a platform rather than this
 binding, and a test runner has no controlling terminal to use instead. It says so at the site.
 
 **The whole raw layer is exercised too**, which is a separate file: a declaration nothing calls is a
 declaration nothing checks, and a signature that disagrees with `uv.h` links perfectly and corrupts
-the call at run time. Every one of the 228 `extern`s is now reached, from the pleasant layer or from
+the call at run time. Every one of the 229 `extern`s is now reached, from the pleasant layer or from
 `raw_tests.sysl` directly. `uv_cancel` was the one exception until the thread pool arrived — it may
 only be called on a request still in flight, and on a finished one it faults, so there was nothing
 safe to call it from. `Work.cancel` is that caller now, because a request knows whether it is still
@@ -570,6 +570,14 @@ handle a program ever opened with every other test still green. `closing_frees` 
 of each handle type per round and asserts resident memory stops growing once the allocator has
 settled. Removing one line from any single `finish_close` turns it red; that was checked against
 three of them.
+
+**The read buffer is watched the same way, with the C heap as the observer.** Every stream on a
+thread reads into one shared buffer that libuv asks for only when bytes are ready, so a reader that
+is waiting holds nothing. Two hundred armed readers on idle sockets grow the heap by about two
+kilobytes, which is their callbacks. With one 64 KiB buffer per stream they grew it by sixteen
+megabytes. The tests beside it check that two streams read in one turn of the loop each see their
+own bytes, that a large read is not cut to a smaller stream's `buffer_size`, and that stopping or
+closing a stream from inside its own read callback leaves the others reading.
 
 ### Under AddressSanitizer
 

@@ -87,4 +87,9 @@ int sysl_uv_thread_create_ex(uv_thread_t *tid, unsigned int flags, size_t stack_
  * has no such path. */
 size_t sysl_uv_default_path(char *buf, size_t size);
 
+/* The bytes the C heap has handed out and not had back, for the tests that check a waiting reader
+ * holds no buffer.  libc answers it on macOS (`mstats`) and glibc (`mallinfo2`); elsewhere the answer
+ * is 0, which those tests read as "cannot measure here". */
+size_t sysl_uv_heap_in_use(void);
+
 #endif /* SYSL_UV_SHIM_H */

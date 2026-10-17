@@ -64,7 +64,6 @@ impl Handle for Tty
 
         self.st.on_read = ignore_read
         self.st.on_connection = noop
-        self.st.buffer = [0; 0]
         self.on_closed = noop
         self.me = None
 

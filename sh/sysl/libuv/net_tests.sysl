@@ -9,7 +9,9 @@ module sh.sysl.libuv
 // about writing, back-pressure or blocking mode is about that and not about a connection being
 // established first.
 
+import sh.sysl.libuv.c
 import sysl.buf.{Buf, buf}
+import sysl.testing.skip
 
 private struct Seen
     bytes: Buf[u8]
@@ -251,6 +253,215 @@ blocking_writes()
 
     writer.close()
     lp.run().expect("the loop ran")
+
+// -- The read buffer ------------------------------------------------------------------------------
+//
+// Every stream on a thread reads into one buffer, handed out by libuv's allocation callback the
+// moment bytes are ready. These are what that has to keep true: a waiting reader holds nothing, two
+// readers in one turn of the loop see their own bytes, a large read is not cut to a smaller stream's
+// size, and a callback that stops or closes its own stream leaves the others reading.
+
+private struct Chunks
+    bytes: Buf[u8]
+    largest: usize
+
+private chunks() -> &Chunks = Chunks(buf(), 0)
+
+private take(into: &Chunks, bytes: []const u8)
+    into.bytes.extend(bytes)
+
+    if bytes.len > into.largest then into.largest = bytes.len
+
+@test("two hundred readers waiting on idle sockets hold no read buffer between them")
+waiting_readers_hold_nothing()
+    if c.heap_in_use() == 0 then skip("this libc does not say how much of its heap is in use")
+
+    val lp = new_loop().expect("a loop")
+    val ends: Buf[&Pipe] = buf()
+
+    for i in 0..<100
+        val (one, two) = connected_pair(lp)
+
+        ends.push(one)
+        ends.push(two)
+
+    val before = c.heap_in_use()
+
+    for i in 0..<ends.len()
+        ends[i].read_start(ignore_read).expect("reading")
+
+    val after = c.heap_in_use()
+    val held = if after > before then after - before else 0
+
+    // One 64 KiB buffer each would be 12.5 MiB. What is left is the callbacks, and a buffer of one
+    // reader's size at most would still be far under an eighth of that.
+    assert(held < 200 * 65536 / 8, s"200 waiting readers hold $held bytes")
+
+    for i in 0..<ends.len()
+        ends[i].close()
+
+    lp.run().expect("the loop drained")
+
+@test("two streams read in one turn of the loop each see their own bytes")
+own_bytes_each()
+    val lp = new_loop().expect("a loop")
+    val (a, a_peer) = connected_pair(lp)
+    val (b, b_peer) = connected_pair(lp)
+    val got_a = seen()
+    val got_b = seen()
+
+    a.read_start((r) -> r match
+        Data(bytes) -> got_a.bytes.extend(bytes)
+        End -> ()
+        Failed(_) -> ()).expect("reading")
+
+    b.read_start((r) -> r match
+        Data(bytes) -> got_b.bytes.extend(bytes)
+        End -> ()
+        Failed(_) -> ()).expect("reading")
+
+    a_peer.write([1, 1, 1]).expect("queued")
+    b_peer.write([2, 2]).expect("queued")
+
+    while got_a.bytes.len() < 3 || got_b.bytes.len() < 2
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    assert_eq(got_a.bytes.len(), 3)
+    assert_eq(got_b.bytes.len(), 2)
+
+    for byte in got_a.bytes.view()
+        assert_eq(byte, 1)
+
+    for byte in got_b.bytes.view()
+        assert_eq(byte, 2)
+
+    a.close()
+    b.close()
+    a_peer.close()
+    b_peer.close()
+    lp.run().expect("the loop drained")
+
+@test("a read larger than another stream's buffer_size arrives whole, and the small one stays small")
+large_after_small()
+    val lp = new_loop().expect("a loop")
+    val (small, small_peer) = connected_pair(lp)
+    val (large, large_peer) = connected_pair(lp)
+    val little = chunks()
+    val lots = chunks()
+
+    small.read_start((r) -> r match
+        Data(bytes) -> take(little, bytes)
+        End -> ()
+        Failed(_) -> (), 16).expect("reading")
+
+    small_peer.write([5; 100]).expect("queued")
+
+    while little.bytes.len() < 100
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    large.read_start((r) -> r match
+        Data(bytes) -> take(lots, bytes)
+        End -> ()
+        Failed(_) -> ()).expect("reading")
+
+    var big: []u8 = [0; 40000]
+
+    for i in 0..<big.len
+        big[i] = u8(i % 251)
+
+    large_peer.write(big).expect("queued")
+
+    while lots.bytes.len() < 40000
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    assert(lots.largest > 16, s"the largest read was ${lots.largest} bytes")
+
+    for i in 0..<big.len
+        assert_eq(lots.bytes[i], u8(i % 251))
+
+    // The shared buffer is now at least 40 000 bytes long, and the small reader is still capped.
+    small_peer.write([6; 100]).expect("queued")
+
+    while little.bytes.len() < 200
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    assert_eq(little.largest, 16)
+    assert_eq(little.bytes[199], 6)
+
+    small.close()
+    large.close()
+    small_peer.close()
+    large_peer.close()
+    lp.run().expect("the loop drained")
+
+@test("read_stop inside the read callback stops delivery there")
+stop_inside_the_callback()
+    val lp = new_loop().expect("a loop")
+    val (one, two) = connected_pair(lp)
+    val got = seen()
+
+    one.read_start((r) -> r match
+        Data(bytes) ->
+            got.bytes.extend(bytes)
+            got.count += 1
+            one.read_stop().expect("stopped")
+        End -> ()
+        Failed(_) -> (), 4).expect("reading")
+
+    two.write([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).expect("queued")
+
+    while got.count == 0
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    lp.run(RUN_NOWAIT).expect("the loop turned")
+    lp.run(RUN_NOWAIT).expect("the loop turned")
+
+    assert_eq(got.count, 1)
+    assert_eq(got.bytes.len(), 4)
+
+    one.close()
+    two.close()
+    lp.run().expect("the loop drained")
+
+@test("a stream closed inside its read callback leaves the next stream reading")
+close_inside_the_callback()
+    val lp = new_loop().expect("a loop")
+    val (a, a_peer) = connected_pair(lp)
+    val (b, b_peer) = connected_pair(lp)
+    val got_a = seen()
+    val got_b = seen()
+
+    a.read_start((r) -> r match
+        Data(bytes) ->
+            got_a.bytes.extend(bytes)
+            a.close()
+        End -> ()
+        Failed(_) -> ()).expect("reading")
+
+    b.read_start((r) -> r match
+        Data(bytes) -> got_b.bytes.extend(bytes)
+        End -> ()
+        Failed(_) -> ()).expect("reading")
+
+    a_peer.write([1, 2, 3]).expect("queued")
+    b_peer.write([4, 5]).expect("queued")
+
+    while got_a.bytes.len() < 3 || got_b.bytes.len() < 2
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    b_peer.write([6]).expect("queued")
+
+    while got_b.bytes.len() < 3
+        lp.run(RUN_ONCE).expect("the loop turned")
+
+    assert_eq(got_a.bytes.len(), 3)
+    assert_eq(got_b.bytes[0], 4)
+    assert_eq(got_b.bytes[2], 6)
+
+    b.close()
+    a_peer.close()
+    b_peer.close()
+    lp.run().expect("the loop drained")
 
 // -- TCP ------------------------------------------------------------------------------------------
 
