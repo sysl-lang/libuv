@@ -15,6 +15,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 
 /** A timer. Reached through `&Timer`, and alive from `timer()` until `close`.
  *

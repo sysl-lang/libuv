@@ -37,6 +37,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 
 // The callback a handle carries when it has none: something has to be in the field, and a closure
 // that does nothing is cheaper to call than an `Option` is to test.

@@ -16,6 +16,7 @@ module sh.sysl.libuv
 // declaration could not carry, and `work_tests.sysl` exercises both sides of it.
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 import sysl.text.cstring
 import sysl.text.from_cstring
 

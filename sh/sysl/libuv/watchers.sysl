@@ -21,6 +21,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 
 /** Called every turn of the loop, and stops it ever going to sleep. */
 struct Idle

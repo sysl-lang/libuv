@@ -25,6 +25,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 
 /** A handle whose only operation is "wake the loop up and run this". */
 struct Async

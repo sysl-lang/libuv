@@ -25,6 +25,12 @@ private struct Shared
 
 private shared() -> &sync Shared = Shared(Atomic(0), Atomic(0), Atomic(0), Atomic(0))
 
+// A heap cell for a job to write through a raw pointer.
+private struct Slot
+    answer: int
+
+private answer_slot() -> &sync Slot = Slot(0)
+
 // What only the loop's thread touches: an ordinary `&T`, since a completion callback crosses
 // nothing.
 private struct Report
@@ -94,19 +100,20 @@ work_batch()
 work_captures_a_pointer()
     val lp = default_loop()
     val r = report()
-    var answer = 0
+    val slot = answer_slot()
 
     // A `*T` is on the crossable list because *it* has no refcount -- which says nothing about what
-    // is at the far end, and is why the annotation on `queue` looks through one. The frame holding
-    // `answer` outlives the job, because `run` below does not return until the job has reported.
-    val p = &answer
+    // is at the far end, and is why the annotation on `queue` looks through one. The pointer is
+    // into a heap object the test holds a count on, so it outlives the job as far as the compiler
+    // can see, and `run` below does not return until the job has reported.
+    val p = &slot.answer
 
     queue(() -> p[0] = 41 + 1, (out) -> r.note(out), lp).expect("queued")
 
     lp.run().expect("the loop ran")
 
     assert_eq(r.n, 1)
-    assert_eq(answer, 42)
+    assert_eq(slot.answer, 42)
 
 // -- Cancelling -----------------------------------------------------------------------------------
 

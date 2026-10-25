@@ -31,6 +31,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 
 /** A TCP socket -- a listener, a connection, or a handle that is neither yet. */
 struct Tcp

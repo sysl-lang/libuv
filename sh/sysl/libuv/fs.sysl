@@ -19,6 +19,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 import sysl.buf.{Buf, buf}
 import sysl.slices.{as_ptr, as_mut_ptr}
 import sysl.text.cstring

@@ -50,6 +50,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 import sysl.text.{cstring, from_cstring}
 
 // A body for a thread that has finished, so that the field is never empty. The `&sync` counterpart

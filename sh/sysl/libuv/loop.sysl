@@ -21,6 +21,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 import sysl.slices.as_mut_ptr
 
 /** An event loop. Reached through `&Loop`, which is what keeps it alive for as long as any handle

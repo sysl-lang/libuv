@@ -56,6 +56,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 
 // The job a request carries once it has run: something has to be in the field, and a closure that
 // does nothing is cheaper to call than an `Option` is to test. It is the `&sync` counterpart of

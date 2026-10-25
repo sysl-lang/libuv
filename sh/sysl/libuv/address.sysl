@@ -16,6 +16,7 @@
 module sh.sysl.libuv
 
 import sh.sysl.libuv.c
+import sysl.raw.ptr_cast
 import sysl.text.cstring
 import sysl.text.from_cstring
 
@@ -49,9 +50,9 @@ end Address
 impl Display for Address
     display(self, out: *Writer, fmt: FormatSpec)
         val host = self.ip()
-        var text = s"$host:${str(self.port())}"
+        var text = s"$host:${self.port().to_string()}"
 
-        if self.family() == AF_INET6 then text = s"[$host]:${str(self.port())}"
+        if self.family() == AF_INET6 then text = s"[$host]:${self.port().to_string()}"
 
         display_str(text, out, fmt)
 
