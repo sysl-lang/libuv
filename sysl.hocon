@@ -3,11 +3,11 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       libuv { git = "github.com/sysl-lang/libuv", version = "0.1.16" }
+//       libuv { git = "github.com/sysl-lang/libuv", version = "0.1.17" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
-// tag `v0.1.16` on this repository.
+// tag `v0.1.17` on this repository.
 //
 // **libuv has to be installed, and so do its headers.** Nothing is vendored here beyond a small
 // shim: libuv is a large C project with a platform backend per operating system, and a package
@@ -27,21 +27,14 @@
 
 package {
   name    = "libuv"
-  version = "0.1.16"
+  version = "0.1.17"
 
   // **The compiler this was written against and the only one it is known to build with.**
   //
-  // The newest feature it certainly needs is a closure written as an argument opening its own
-  // indented block — `t.start(0, 1000, () -> …)` is the shape every callback here is registered
-  // with, and that arrived in 0.0.76. An older compiler refuses those files with `newline expected`
-  // pointing at the first line of the body, which reads as a defect in the example rather than as a
-  // compiler too old to have the feature.
-  //
-  // The floor is written at 0.0.83 because that is where cards 0304 and 0305 closed: a `?` in a
-  // function whose result is a struct over 128 bytes, and `str`/`s"$x"` on one through `Display`.
-  // This package used to work around both; it no longer does, and an older compiler fails the way
-  // the comments this replaced described.
-  sysl = "0.1.0-alpha.10"
+  // The floor is 0.6.0 because the sources import the raw pointer casts from `sysl.raw` and spell
+  // string conversion `.to_string()`, neither of which exists on 0.5.x. It builds there without a
+  // warning.
+  sysl = "0.6.0"
 }
 
 // **`posix`, because an event loop is the operating system's.** epoll, kqueue, a thread pool, a
