@@ -468,6 +468,10 @@ loop_fork()
 //
 // The first round is a warm-up for exactly that reason: what is asserted is the growth *after* the
 // allocator has settled.
+//
+// **It is left out of an AddressSanitizer build**, whose shadow memory and quarantine make resident
+// memory say nothing about what the program freed; the sanitizer itself reports a leak there.
+#if !sanitize_address
 @test("closing a handle releases it, for every kind of handle there is, and a finished job too")
 closing_frees()
     val lp = default_loop()
@@ -485,6 +489,7 @@ closing_frees()
     // Two rounds that free nothing grow by tens of megabytes; two that free everything grow by
     // nothing at all. A mebibyte is far below the first and far above the second.
     assert(grew < 1048576, "closed handles were freed rather than kept")
+#endif
 
 private work_nothing() -> unit = ()
 
