@@ -295,7 +295,8 @@ async_file_round_trip()
                                         got.bytes.extend(bytes)
                                         got.done = true
 
-                                close(f, ignore_status, lp), 0, lp), -1, lp),
+                                close(f, ignore_status, lp).expect("the close started"), 0, lp)
+                                    .expect("the read started"), -1, lp).expect("the write started"),
         O_RDWR | O_CREAT, S_IRUSR | S_IWUSR, lp).expect("the open started")
 
     assert(!got.done, "nothing has happened before the loop runs")
@@ -331,7 +332,8 @@ async_directory()
 
                     rmdir(dir + "/made", (done) ->
                         done.expect("removed")
-                        got.done = true, lp), lp), 511, lp).expect("the mkdir started")
+                        got.done = true, lp).expect("the rmdir started"), lp)
+                        .expect("the scandir started"), 511, lp).expect("the mkdir started")
 
     lp.run().expect("the loop ran")
 
@@ -396,7 +398,7 @@ async_rename_and_unlink()
 
         unlink(dir + "/to", (done) ->
             done.expect("removed")
-            got.done = true, lp), lp).expect("the rename started")
+            got.done = true, lp).expect("the unlink started"), lp).expect("the rename started")
 
     lp.run().expect("the loop ran")
 

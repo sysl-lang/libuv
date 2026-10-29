@@ -234,7 +234,8 @@ read_file_sync(path: string) -> Result[[]u8, Error]
     val info = f.stat_sync()
 
     if info.is_err()
-        f.close_sync()
+        // The stat's error is the one worth reporting; a close failing on top of it would only hide it.
+        _ = f.close_sync()
         return Err(info.unwrap_err())
 
     val out: []u8 = [0; usize(info.unwrap().size)]
@@ -244,7 +245,8 @@ read_file_sync(path: string) -> Result[[]u8, Error]
         val n = f.read_sync(out[at..<out.len])
 
         if n.is_err()
-            f.close_sync()
+            // As above: the read's error is the one the caller needs.
+            _ = f.close_sync()
             return Err(n.unwrap_err())
 
         if n.unwrap() == 0 then break
@@ -671,15 +673,25 @@ read_file(path: string, cb: &Fn(Result[[]u8, Error]) -> unit,
 private stat_then_read(f: File, cb: &Fn(Result[[]u8, Error]) -> unit, lp: &Loop)
     val fd = f
 
-    fstat_of(fd, (info) ->
+    // Each step that fails to START answers the callback itself, since nothing else ever will; a
+    // close that fails to start leaks the descriptor at worst, and the answer is already known.
+    val begun = fstat_of(fd, (info) ->
         info match
             Err(e) ->
-                close(fd, ignore_status, lp)
+                _ = close(fd, ignore_status, lp)
                 cb(Err(e))
             Ok(s) ->
-                read(fd, usize(s.size), (got) ->
-                    close(fd, ignore_status, lp)
-                    cb(got), -1, lp), lp)
+                val reading = read(fd, usize(s.size), (got) ->
+                    _ = close(fd, ignore_status, lp)
+                    cb(got), -1, lp)
+
+                if reading.is_err()
+                    _ = close(fd, ignore_status, lp)
+                    cb(Err(reading.unwrap_err())), lp)
+
+    if begun.is_err()
+        _ = close(fd, ignore_status, lp)
+        cb(Err(begun.unwrap_err()))
 
 // `fstat` of an open file, which is the one asynchronous call `File` does not carry as a method --
 // a method taking a callback would read as though the file were doing the waiting.

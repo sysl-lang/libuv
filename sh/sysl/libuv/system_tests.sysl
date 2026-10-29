@@ -97,6 +97,12 @@ load()
 priorities()
     val before = priority().expect("a priority")
 
+    // A process already at the floor (a run under `nice` can start there) has no step left to take,
+    // and libuv refuses to go past it.
+    if before >= 19
+        assert(set_priority(before + 1).is_err(), "nothing is lower than the floor")
+        return
+
     set_priority(before + 1).expect("lowered")
     assert_eq(priority().expect("a priority"), before + 1)
 

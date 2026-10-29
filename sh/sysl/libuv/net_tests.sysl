@@ -47,6 +47,7 @@ private connected_tcp(lp: &Loop) -> (&Tcp, &Tcp, &Tcp)
     val held: &Pair = Pair(None, None)
 
     server.listen(4, () -> held.accepted = Some(server.accept().expect("a connection")))
+        .expect("listening started")
 
     val client = tcp(lp).expect("a socket")
 
@@ -712,6 +713,7 @@ handle_round_trip()
     val held: &Pair = Pair(None, None)
 
     server.listen(4, () -> held.accepted = Some(server.accept().expect("a connection")))
+        .expect("listening started")
 
     val client = tcp(lp).expect("a socket")
 

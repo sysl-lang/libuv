@@ -119,7 +119,7 @@ one_shot()
     val t = timer(lp).expect("a timer")
     val n: &Counter = Counter(0)
 
-    t.start(1, 0, () -> n.bump())
+    t.start(1, 0, () -> n.bump()).expect("the timer started")
     lp.run().expect("the loop ran")
 
     assert_eq(n.value, 1)
@@ -136,7 +136,7 @@ repeating()
 
     t.start(0, 1, () ->
         n.bump()
-        if n.value == 3 then t.close())
+        if n.value == 3 then t.close()).expect("the timer started")
 
     lp.run().expect("the loop ran")
     assert_eq(n.value, 3)
@@ -159,7 +159,7 @@ private start_a_timer_and_forget_it(lp: &Loop, n: &Counter)
 
     t.start(1, 0, () ->
         n.bump()
-        t.close())
+        t.close()).expect("the timer started")
 
 @test("close runs its callback, and after it the handle is gone")
 close_callback()
@@ -180,7 +180,7 @@ unref_lets_the_loop_end()
     val lp = default_loop()
     val t = timer(lp).expect("a timer")
 
-    t.start(60000, 60000, noop)
+    t.start(60000, 60000, noop).expect("the timer started")
     assert(lp.alive(), "a started timer keeps the loop alive")
 
     t.unref()
@@ -262,16 +262,16 @@ tcp_echo()
 
         conn.read_start((r) -> r match
             Data(bytes) ->
-                conn.write(bytes)
-                conn.shutdown()
+                conn.write(bytes).expect("the echo was queued")
+                conn.shutdown().expect("the shutdown was queued")
             End -> conn.close()
-            Failed(_) -> conn.close()))
+            Failed(_) -> conn.close()).expect("reading started")).expect("listening started")
 
     val client = tcp(lp).expect("a socket")
 
     client.connect(where, (r) ->
         r.expect("the connection was made")
-        client.write([104, 105])
+        client.write([104, 105]).expect("the write was queued")
         client.read_start((r) -> r match
             Data(bytes) -> got.add(bytes)
             End ->
@@ -279,7 +279,7 @@ tcp_echo()
                 server.close()
             Failed(_) ->
                 client.close()
-                server.close()))
+                server.close()).expect("reading started")).expect("the connect started")
 
     lp.run().expect("the loop ran")
 
@@ -341,7 +341,7 @@ refused()
 
     client.connect(where, (r) ->
         seen.code = r.unwrap_err().code
-        client.close())
+        client.close()).expect("the connect started")
 
     lp.run().expect("the loop ran")
     assert(seen.code < 0, "the attempt failed, and it failed in the callback")
@@ -363,16 +363,16 @@ pipe_echo()
 
         conn.read_start((r) -> r match
             Data(bytes) ->
-                conn.write(bytes)
-                conn.shutdown()
+                conn.write(bytes).expect("the echo was queued")
+                conn.shutdown().expect("the shutdown was queued")
             End -> conn.close()
-            Failed(_) -> conn.close()))
+            Failed(_) -> conn.close()).expect("reading started")).expect("listening started")
 
     val client = pipe(false, lp).expect("a pipe")
 
     client.connect(path, (r) ->
         r.expect("connected")
-        client.write([7, 8, 9])
+        client.write([7, 8, 9]).expect("the write was queued")
         client.read_start((r) -> r match
             Data(bytes) -> got.add(bytes)
             End ->
@@ -380,7 +380,7 @@ pipe_echo()
                 server.close()
             Failed(_) ->
                 client.close()
-                server.close()))
+                server.close()).expect("reading started")).expect("the connect started")
 
     lp.run().expect("the loop ran")
 
@@ -534,6 +534,28 @@ async_read_file()
     unlink_sync(path).expect("removed")
     rmdir_sync(dir).expect("removed")
 
+@test("the asynchronous read of an empty file answers the callback rather than never")
+async_read_empty_file()
+    val lp = default_loop()
+    val dir = mkdtemp_sync("/tmp/libuv-test-XXXXXX").expect("a temporary directory")
+    val path = dir + "/empty"
+    val state: &Held = Held(12345)
+
+    write_file_sync(path, []).expect("written")
+
+    read_file(path, (r) ->
+        r match
+            Ok(bytes) -> state.code = i32(bytes.len)
+            Err(e) -> state.code = e.code, lp).expect("the read started")
+
+    lp.run().expect("the loop ran")
+
+    assert(state.code != 12345, "the callback was called")
+    assert(state.code <= 0, "and it was an empty answer or an error, not data")
+
+    unlink_sync(path).expect("removed")
+    rmdir_sync(dir).expect("removed")
+
 @test("an asynchronous stat of nothing fails in the callback")
 async_stat_missing()
     val lp = default_loop()
@@ -557,7 +579,7 @@ idle_turns()
 
     i.start(() ->
         n.bump()
-        if n.value == 5 then i.close())
+        if n.value == 5 then i.close()).expect("the watcher started")
 
     lp.run().expect("the loop ran")
     assert_eq(n.value, 5)
@@ -569,17 +591,17 @@ prepare_and_check()
     val k = check(lp).expect("a check watcher")
     val order: &Sink = Sink(buf())
 
-    p.start(() -> order.add([112]))
+    p.start(() -> order.add([112])).expect("the prepare watcher started")
     k.start(() ->
         order.add([107])
         p.close()
-        k.close())
+        k.close()).expect("the check watcher started")
 
     // Something has to make the loop turn at all, since two watchers with nothing to wait for
     // would spin: a one-shot timer gives it exactly one turn's worth of work.
     val t = timer(lp).expect("a timer")
 
-    t.start(1, 0, () -> t.close())
+    t.start(1, 0, () -> t.close()).expect("the timer started")
     lp.run().expect("the loop ran")
 
     assert_eq(order.bytes.len(), 2)
@@ -654,7 +676,7 @@ child_process()
     out.read_start((r) -> r match
         Data(bytes) -> got.add(bytes)
         End -> out.close()
-        Failed(_) -> out.close())
+        Failed(_) -> out.close()).expect("reading started")
 
     lp.run().expect("the loop ran")
 
@@ -682,7 +704,7 @@ extra_stdio_slot()
     extra.read_start((r) -> r match
         Data(bytes) -> got.add(bytes)
         End -> extra.close()
-        Failed(_) -> extra.close())
+        Failed(_) -> extra.close()).expect("reading started")
 
     lp.run().expect("the loop ran")
 
