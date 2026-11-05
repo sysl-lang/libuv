@@ -187,7 +187,7 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
 
     val argv: []*u8 = [null; p.strings.len() + 1]
 
-    for i in 0..<p.strings.len() do argv[i] = p.strings.at(i).ptr
+    for i in 0..<p.strings.len() do argv[i] = p.strings[i].ptr
 
     p.argv = argv
 
@@ -201,20 +201,20 @@ spawn(file: string, args: []const string, cb: &Fn(i64, i32) -> unit, stdio: []co
 
         val envp: []*u8 = [null; env.len + 1]
 
-        for i in 0..<env.len do envp[i] = p.strings.at(first + i).ptr
+        for i in 0..<env.len do envp[i] = p.strings[first + i].ptr
 
         p.envp = envp
 
     // What libuv is asked to execute. argv[0] stays the name the caller wrote; only the path the
     // program is loaded from changes, and only for a child that inherits nothing and was given no
     // `PATH` -- libuv would otherwise look on a fallback of its own that differs from the system's.
-    var exe = p.strings.at(0).ptr
+    var exe = p.strings[0].ptr
 
     if !inherit_env
         on_default_path(file, env) match
             Some(full) ->
                 p.strings.push(cstring(full))
-                exe = p.strings.at(p.strings.len() - 1).ptr
+                exe = p.strings[p.strings.len() - 1].ptr
             None -> ()
 
     val dir = cstring(cwd)
