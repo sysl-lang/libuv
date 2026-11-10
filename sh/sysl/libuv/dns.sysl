@@ -81,7 +81,7 @@ private resolve_done(req: *c.GetAddrInfo, status: i32, res: *c.AddrInfo) -> unit
     // libuv's storage, released here -- everything above was copied into storage of ours, which is
     // why the callback may keep what it is given.
     c.freeaddrinfo(res)
-    cb(Ok(found.view()))
+    cb(Ok(found.view_mut()))
 
 /** Resolve `host` and `service`, and call `cb` with every way the resolver found to reach it.
  *

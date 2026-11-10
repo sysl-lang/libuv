@@ -446,7 +446,7 @@ scandir_sync(path: string) -> Result[[]Dirent, Error]
 
     c.fs_req_cleanup(r)
 
-    if code < 0 then Err(Error(code)) else Ok(found.view())
+    if code < 0 then Err(Error(code)) else Ok(found.into_view())
 
 // Walk what a scandir left in the request. libuv hands them back one at a time and owns the name
 // each time, so each is copied here rather than viewed.
@@ -538,7 +538,7 @@ private fs_done(req: *c.Fs) -> unit
         Counted(f) -> f(counted(n))
         Nothing(f) -> f(checked(code))
         Stats(f) -> f(if code < 0 then Err(Error(code)) else Ok(stats))
-        Entries(f) -> f(if code < 0 then Err(Error(code)) else Ok(entries.view()))
+        Entries(f) -> f(if code < 0 then Err(Error(code)) else Ok(entries.into_view()))
         Named(f) -> f(if code < 0 then Err(Error(code)) else Ok(name))
 
 /** Open a file on the thread pool. The flags and the mode are `open_sync`'s. */
