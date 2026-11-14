@@ -3,7 +3,7 @@
 // This is the block a consumer writes to reach this package:
 //
 //     dependencies {
-//       libuv { git = "github.com/sysl-lang/libuv", version = "0.1.21" }
+//       libuv { git = "github.com/sysl-lang/libuv", version = "0.1.22" }
 //     }
 //
 // The coordinate is identity rather than a URL, so it carries no `https://`, and the version is the
@@ -27,7 +27,7 @@
 
 package {
   name    = "libuv"
-  version = "0.1.21"
+  version = "0.1.22"
 
   // **The compiler this was written against and the only one it is known to build with.**
   //

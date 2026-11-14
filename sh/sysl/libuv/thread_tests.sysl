@@ -18,6 +18,8 @@ module sh.sysl.libuv
 import sysl.sync.Atomic
 
 // A count two threads raise, deliberately NOT atomic: it is what the mutex is under test for.
+// Shared on purpose: every write happens under the mutex the test holds.
+@unchecked(Share)
 private struct Counter
     n: int
 
@@ -412,6 +414,8 @@ barrier_meets()
 // compiler says exactly that -- *"its 'queue.elems' reaches a '[]int', which owns its elements
 // through a count that is not atomic"* -- and a fixed array is what a shared queue can be made of
 // today.
+// Shared on purpose: the slots and counts are touched only while `lock` is held.
+@unchecked(Share)
 private struct Mailbox
     lock: &sync Mutex
     ready: &sync Semaphore

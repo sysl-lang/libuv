@@ -106,6 +106,9 @@ set_thread_name(name: string) -> Result[unit, Error]
  * reading a closure that no longer exists. A thread that should not be waited for is given something
  * to wait on instead -- a flag it reads, or a message on its loop.
  */
+// Safe to share: `me` and `body` are written before the thread starts and by the one joiner after
+// it ends, and `join` answers EINVAL the second time.
+@unchecked(Share)
 struct Thread
     private tid: [c.THREAD_WORDS]u64
     private me: Option[&sync Thread]
@@ -222,6 +225,8 @@ thread_with_stack(body: &sync Fn() -> unit, stack: usize) -> Result[&sync Thread
  * **A plain mutex is not recursive.** Locking one twice from one thread deadlocks; `recursive_mutex`
  * is the one that counts instead.
  */
+// Safe to share: an OS mutex handle, synchronised by the operating system.
+@unchecked(Share)
 struct Mutex
     private storage: [c.MUTEX_WORDS]u64
 
@@ -294,6 +299,8 @@ recursive_mutex() -> Result[&sync Mutex, Error]
  *     val item = queue.pop()
  *     inbox.unlock()
  */
+// Safe to share: an OS condition variable, synchronised by the operating system.
+@unchecked(Share)
 struct Cond
     private storage: [c.COND_WORDS]u64
 
@@ -335,6 +342,8 @@ cond() -> Result[&sync Cond, Error]
  * `wait` takes it and returns immediately, which is what makes a semaphore the simple answer to
  * "let me know when you have started".
  */
+// Safe to share: an OS semaphore, synchronised by the operating system.
+@unchecked(Share)
 struct Semaphore
     private storage: [c.SEM_WORDS]u64
 
@@ -369,6 +378,8 @@ semaphore(value: u32 = 0) -> Result[&sync Semaphore, Error]
  * **Taking the write lock while holding the read lock deadlocks**, whichever thread does it, and
  * upgrading is not something either libuv or pthreads offers.
  */
+// Safe to share: an OS read-write lock, synchronised by the operating system.
+@unchecked(Share)
 struct RwLock
     private storage: [c.RWLOCK_WORDS]u64
 
@@ -427,6 +438,8 @@ rwlock() -> Result[&sync RwLock, Error]
  * so the next phase may read all of it. A barrier waiting for a thread that has already finished
  * waits for ever, so the count has to be the number that really will arrive.
  */
+// Safe to share: an OS barrier, synchronised by the operating system.
+@unchecked(Share)
 struct Barrier
     private storage: [c.BARRIER_WORDS]u64
 
